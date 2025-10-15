@@ -2,7 +2,8 @@
 set -e
 
 # ==============================
-# 🚀 WordPress 终极自动部署 v3.1
+# 🚀 WordPress 终极自动部署 v4.0
+# 支持 PHP 8.3 + 完整 XML 导入 + Swap + PHP/Nginx/SSL 优化
 # ==============================
 
 # === 用户输入 ===
@@ -53,16 +54,24 @@ fi
 
 # ---------------- MySQL 配置 ----------------
 echo "🛠️ 配置 MySQL root 用户..."
-# 强制 root 使用密码登录
-mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}'; FLUSH PRIVILEGES;"
+# 修复 auth_socket 问题
+if mysql -u root -e "SELECT user, plugin FROM mysql.user WHERE user='root';" | grep -q "auth_socket"; then
+    echo "🔧 检测到 root 使用 auth_socket，切换为密码登录..."
+    mysql -u root <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}';
+FLUSH PRIVILEGES;
+EOF
+fi
 
-# 创建数据库和用户
+# 确保 root 密码可用
+mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "SELECT 1;" >/dev/null 2>&1 || { echo "❌ MySQL root 登录失败，请检查密码！"; exit 1; }
+
 mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`;"
 mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';"
 mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;"
 
 # ---------------- 安装 WordPress ----------------
-echo "⬇️ 下载 WordPress..."
+echo "⬇️ 下载并安装 WordPress..."
 mkdir -p ${WP_PATH}
 cd /tmp && wget -q https://wordpress.org/latest.tar.gz && tar -xzf latest.tar.gz
 cp -a wordpress/. ${WP_PATH}
@@ -120,21 +129,22 @@ done
 
 systemctl restart php${PHP_VERSION}-fpm nginx
 
+# ---------------- 强制启用 simplexml ----------------
+echo "🔎 检查并强制启用 simplexml..."
+PHP_EXT_DIR=$(php -i | grep '^extension_dir' | awk '{print $3}')
+if [ ! -f "${PHP_EXT_DIR}/simplexml.so" ]; then
+    echo "❌ simplexml 模块缺失，请确保 php8.3-xml 已安装"
+else
+    echo "extension=simplexml.so" > /etc/php/${PHP_VERSION}/mods-available/simplexml.ini
+    phpenmod simplexml
+    systemctl restart php${PHP_VERSION}-fpm
+    php -m | grep -q '^simplexml$' && echo "✅ simplexml 已启用" || echo "❌ simplexml 启用失败"
+fi
+
 # ---------------- 检查 PHP 扩展 ----------------
 echo "🔍 检查 PHP 扩展..."
 for EXT in simplexml dom xmlreader xmlwriter mbstring curl xsl; do
-    if php -m | grep -q "^${EXT}$"; then
-        echo "✅ ${EXT} 已加载"
-    else
-        echo "❌ ${EXT} 缺失"
-        # 尝试强制启用 simplexml
-        if [ "$EXT" == "simplexml" ]; then
-            echo "🔧 尝试安装 php-xml 并启用 simplexml..."
-            apt install -y php${PHP_VERSION}-xml
-            systemctl restart php${PHP_VERSION}-fpm
-            php -m | grep -q "^simplexml$" && echo "✅ simplexml 已加载" || echo "❌ simplexml 启用失败，请检查 PHP 模块目录"
-        fi
-    fi
+    php -m | grep -q "$EXT" && echo "✅ $EXT 已加载" || echo "❌ $EXT 缺失"
 done
 
 # ---------------- 可选导入 XML ----------------
