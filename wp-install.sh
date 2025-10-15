@@ -2,9 +2,10 @@
 set -e
 
 # ==============================
-# 🚀 WordPress 终极自动部署 v3.1（修复 simplexml）
+# 🚀 WordPress 终极自动部署 v3.1
 # ==============================
 
+# === 用户输入 ===
 read -p "请输入 MySQL 数据库名: " DB_NAME
 read -p "请输入 MySQL 用户名: " DB_USER
 read -s -p "请输入 MySQL 用户密码: " DB_PASSWORD
@@ -21,56 +22,47 @@ SWAP_SIZE="2G"
 echo "=============== 🚀 开始安装 WordPress ==============="
 
 # ---------------- 系统更新 ----------------
+echo "🔄 更新系统..."
 apt update -y && apt upgrade -y
 
 # ---------------- 安装依赖 ----------------
+echo "📦 安装 Nginx、MySQL、PHP 及扩展..."
 apt install -y nginx mysql-server php${PHP_VERSION}-fpm php${PHP_VERSION}-cli \
 php-mysql php-curl php-gd php-intl php-mbstring php-soap php-xml php-zip php-xsl \
 imagemagick php${PHP_VERSION}-imagick unzip wget curl certbot python3-certbot-nginx
 
-# ---------------- 修复 simplexml 缺失 ----------------
-echo "🧩 检查并强制启用 simplexml..."
-EXT_DIR=$(php -i | grep '^extension_dir' | awk '{print $3}')
-if [ -f "${EXT_DIR}/simplexml.so" ]; then
-    echo "extension=simplexml" > /etc/php/${PHP_VERSION}/mods-available/simplexml.ini
-    phpenmod simplexml
-else
-    echo "⚠️ 未找到 simplexml.so，尝试重新安装 XML 模块..."
-    apt install -y php${PHP_VERSION}-xml
-    echo "extension=simplexml" > /etc/php/${PHP_VERSION}/mods-available/simplexml.ini
-    phpenmod simplexml
-fi
-systemctl restart php${PHP_VERSION}-fpm
-
-# 验证加载
-if php -m | grep -q simplexml; then
-    echo "✅ simplexml 已成功启用"
-else
-    echo "❌ simplexml 启用失败，请检查 PHP 模块目录: ${EXT_DIR}"
+# ---------------- 安装 WP-CLI ----------------
+if ! command -v wp &> /dev/null; then
+    echo "⚙️ 安装 WP-CLI..."
+    curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+    chmod +x wp-cli.phar
+    mv wp-cli.phar /usr/local/bin/wp
 fi
 
 # ---------------- 创建 Swap ----------------
 if ! swapon --show | grep -q '^'; then
+    echo "💾 创建 Swap..."
     fallocate -l ${SWAP_SIZE} /swapfile
     chmod 600 /swapfile
     mkswap /swapfile
     swapon /swapfile
     echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
+else
+    echo "💾 Swap 已存在"
 fi
 
 # ---------------- MySQL 配置 ----------------
-if mysql -u root -e "SELECT user, plugin FROM mysql.user WHERE user='root';" | grep -q "auth_socket"; then
-    mysql -u root <<EOF
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}';
-FLUSH PRIVILEGES;
-EOF
-fi
+echo "🛠️ 配置 MySQL root 用户..."
+# 强制 root 使用密码登录
+mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}'; FLUSH PRIVILEGES;"
 
+# 创建数据库和用户
 mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`;"
 mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';"
 mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;"
 
 # ---------------- 安装 WordPress ----------------
+echo "⬇️ 下载 WordPress..."
 mkdir -p ${WP_PATH}
 cd /tmp && wget -q https://wordpress.org/latest.tar.gz && tar -xzf latest.tar.gz
 cp -a wordpress/. ${WP_PATH}
@@ -79,6 +71,7 @@ find ${WP_PATH} -type d -exec chmod 755 {} \;
 find ${WP_PATH} -type f -exec chmod 644 {} \;
 
 # ---------------- Nginx 配置 ----------------
+echo "🌐 配置 Nginx..."
 cat > /etc/nginx/conf.d/${DOMAIN}.conf <<EOF
 server {
     listen 80;
@@ -111,9 +104,11 @@ EOF
 nginx -t && systemctl reload nginx
 
 # ---------------- SSL ----------------
+echo "🔐 申请 SSL..."
 certbot --nginx -d "${DOMAIN}" --email "${SSL_EMAIL}" --agree-tos --no-eff-email || echo "⚠️ SSL 自动申请失败，请稍后重试"
 
 # ---------------- PHP 优化 ----------------
+echo "⚙️ 优化 PHP 配置..."
 for INI in /etc/php/${PHP_VERSION}/{fpm,cli}/php.ini; do
     sed -i "s/^upload_max_filesize.*/upload_max_filesize = 1024M/" $INI
     sed -i "s/^post_max_size.*/post_max_size = 1024M/" $INI
@@ -122,12 +117,24 @@ for INI in /etc/php/${PHP_VERSION}/{fpm,cli}/php.ini; do
     sed -i "s/^max_input_time.*/max_input_time = 1800/" $INI
     grep -q "^max_input_vars" $INI || echo "max_input_vars = 10000" >> $INI
 done
+
 systemctl restart php${PHP_VERSION}-fpm nginx
 
-# ---------------- 检查扩展 ----------------
+# ---------------- 检查 PHP 扩展 ----------------
 echo "🔍 检查 PHP 扩展..."
 for EXT in simplexml dom xmlreader xmlwriter mbstring curl xsl; do
-    php -m | grep -q "$EXT" && echo "✅ $EXT 已加载" || echo "❌ $EXT 缺失"
+    if php -m | grep -q "^${EXT}$"; then
+        echo "✅ ${EXT} 已加载"
+    else
+        echo "❌ ${EXT} 缺失"
+        # 尝试强制启用 simplexml
+        if [ "$EXT" == "simplexml" ]; then
+            echo "🔧 尝试安装 php-xml 并启用 simplexml..."
+            apt install -y php${PHP_VERSION}-xml
+            systemctl restart php${PHP_VERSION}-fpm
+            php -m | grep -q "^simplexml$" && echo "✅ simplexml 已加载" || echo "❌ simplexml 启用失败，请检查 PHP 模块目录"
+        fi
+    fi
 done
 
 # ---------------- 可选导入 XML ----------------
@@ -136,6 +143,7 @@ if [[ -n "$XML_FILE" && -f "$XML_FILE" ]]; then
     sudo -u www-data wp import "$XML_FILE" --authors=create --path="${WP_PATH}" --allow-root
 fi
 
+# ---------------- 完成 ----------------
 echo "🎉 WordPress 已安装完成！"
 echo "🌍 访问: https://${DOMAIN}"
 echo "📁 路径: ${WP_PATH}"
