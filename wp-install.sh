@@ -175,8 +175,16 @@ echo "🔎 检查并强制启用 simplexml..."
 apt install -y php${PHP_VERSION}-xml
 
 # 检查 simplexml 是否已加载
-if php -m | grep -q "simplexml"; then
+if php -m | grep -q "simplexml" || php -r 'exit(extension_loaded("simplexml") ? 0 : 1);'; then
     echo "✅ simplexml 已加载"
+    # 确认 simplexml 功能是否可用
+    if php -r 'exit(class_exists("SimpleXMLElement") ? 0 : 1);'; then
+        echo "✅ SimpleXMLElement 类可用，模块正常工作"
+    else
+        echo "⚠️ SimpleXMLElement 类不可用，尝试修复..."
+        apt install -y --reinstall php${PHP_VERSION}-xml libxml2 libxml2-dev
+        systemctl restart php${PHP_VERSION}-fpm
+    fi
 else
     echo "⚠️ simplexml 未加载，尝试手动启用..."
     
@@ -199,7 +207,7 @@ else
     systemctl restart php${PHP_VERSION}-fpm
     
     # 再次检查
-    if php -m | grep -q "simplexml"; then
+    if php -m | grep -q "simplexml" || php -r 'exit(extension_loaded("simplexml") ? 0 : 1);'; then
         echo "✅ simplexml 已成功启用"
     else
         echo "⚠️ simplexml 仍未加载，尝试最后的方法..."
@@ -214,8 +222,15 @@ fi
 echo "🔍 检查 PHP 扩展..."
 MISSING_EXTS=""
 for EXT in simplexml dom xmlreader xmlwriter mbstring curl xsl; do
-    if php -m | grep -q "$EXT"; then
+    # 使用两种方法检查扩展是否加载：php -m 和 extension_loaded
+    if php -m | grep -q "$EXT" || php -r "exit(extension_loaded('$EXT') ? 0 : 1);" 2>/dev/null; then
         echo "✅ $EXT 已加载"
+        
+        # 对于 simplexml，额外验证功能是否正常
+        if [ "$EXT" = "simplexml" ] && ! php -r "exit(class_exists('SimpleXMLElement') ? 0 : 1);" 2>/dev/null; then
+            echo "⚠️ $EXT 已加载但功能异常，尝试修复..."
+            MISSING_EXTS="$MISSING_EXTS $EXT"
+        fi
     else
         echo "❌ $EXT 缺失"
         MISSING_EXTS="$MISSING_EXTS $EXT"
@@ -225,18 +240,45 @@ done
 # 如果有缺失的扩展，尝试安装
 if [ ! -z "$MISSING_EXTS" ]; then
     echo "⚠️ 尝试安装缺失的扩展: $MISSING_EXTS"
-    apt install -y php${PHP_VERSION}-xml php${PHP_VERSION}-mbstring php${PHP_VERSION}-curl php${PHP_VERSION}-xsl
+    apt install -y --reinstall php${PHP_VERSION}-xml php${PHP_VERSION}-mbstring php${PHP_VERSION}-curl php${PHP_VERSION}-xsl
     systemctl restart php${PHP_VERSION}-fpm
     
     # 再次检查
     echo "🔍 再次检查扩展..."
     for EXT in $MISSING_EXTS; do
-        if php -m | grep -q "$EXT"; then
-            echo "✅ $EXT 已成功安装"
+        if php -m | grep -q "$EXT" || php -r "exit(extension_loaded('$EXT') ? 0 : 1);" 2>/dev/null; then
+            # 对于 simplexml，额外验证功能是否正常
+            if [ "$EXT" = "simplexml" ]; then
+                if php -r "exit(class_exists('SimpleXMLElement') ? 0 : 1);" 2>/dev/null; then
+                    echo "✅ $EXT 已成功安装且功能正常"
+                else
+                    echo "⚠️ $EXT 已加载但功能异常，可能需要手动修复"
+                fi
+            else
+                echo "✅ $EXT 已成功安装"
+            fi
         else
-            echo "❌ $EXT 仍然缺失"
+            echo "❌ $EXT 仍然缺失，请手动安装并检查 PHP 配置"
         fi
     done
+fi
+
+# 添加功能测试，确认 SimpleXML 实际可用
+echo "🧪 测试 SimpleXML 功能..."
+if php -r '
+$test = "<root><item>Test</item></root>";
+try {
+    $xml = new SimpleXMLElement($test);
+    echo $xml->item . PHP_EOL;
+    exit(0);
+} catch (Exception $e) {
+    echo $e->getMessage() . PHP_EOL;
+    exit(1);
+}
+' 2>/dev/null; then
+    echo "✅ SimpleXML 功能测试通过"
+else
+    echo "⚠️ SimpleXML 功能测试失败，但不影响继续安装"
 fi
 
 # ---------------- 可选导入 XML ----------------
