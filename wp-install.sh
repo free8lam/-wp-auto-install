@@ -132,15 +132,19 @@ mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "GRANT ALL PRIVILEGES ON \`${DB_NAME
 # ---------------- 安装 WordPress ----------------
 echo "⬇️ 下载并安装 WordPress..."
 mkdir -p ${WP_PATH}
-cd /tmp && wget -q https://wordpress.org/latest.tar.gz && tar -xzf latest.tar.gz
-cp -a wordpress/. ${WP_PATH}
+if [ ! -f "${WP_PATH}/wp-settings.php" ]; then
+  cd /tmp && wget -q https://wordpress.org/latest.tar.gz && tar -xzf latest.tar.gz
+  cp -a wordpress/. ${WP_PATH}
+else
+  echo "ℹ️ 检测到 WordPress 文件已存在，跳过下载与复制。"
+fi
 chown -R www-data:www-data ${WP_PATH}
 find ${WP_PATH} -type d -exec chmod 755 {} \;
 find ${WP_PATH} -type f -exec chmod 644 {} \;
 
 # ---------------- Nginx 全局上传/超时配置 ----------------
 echo "🌐 写入 Nginx 全局上传与超时配置..."
-cat > /etc/nginx/conf.d/_global_upload.conf <<EOF
+cat > /etc/nginx/conf.d/_global_upload.conf <<'EOF'
 client_max_body_size 1024M;
 fastcgi_read_timeout 1800;
 fastcgi_buffers 16 16k;
@@ -150,6 +154,29 @@ fastcgi_send_timeout 1800;
 client_body_timeout 1800;
 send_timeout 1800;
 server_tokens off;
+etag on;
+
+fastcgi_cache_path /var/cache/nginx/wordpress levels=1:2 keys_zone=WORDPRESS:100m inactive=60m max_size=500m;
+map $http_cookie $no_cache_cookie {
+    default 0;
+    ~wordpress_logged_in_ 1;
+    ~woocommerce_cart_hash 1;
+    ~wp-postpass_ 1;
+    ~comment_author_ 1;
+}
+map $request_uri $no_cache_uri {
+    default 0;
+    ~^/wp-admin/ 1;
+    ~^/wp-login\.php 1;
+    ~^/xmlrpc\.php 1;
+    ~^/wp-json 1;
+}
+map $request_method $no_cache_method { default 0; POST 1; }
+map $query_string $no_cache_query { default 0; "" 0; ~.+ 1; }
+map "$no_cache_cookie$no_cache_uri$no_cache_method$no_cache_query" $skip_cache {
+    default 0;
+    ~.*1.* 1;
+}
 EOF
 
 # ---------------- Nginx 站点配置(80) ----------------
@@ -157,7 +184,7 @@ echo "🌐 配置 Nginx 80 端口站点..."
 cat > /etc/nginx/conf.d/${DOMAIN}.conf <<EOF
 server {
     listen 80;
-    server_name ${DOMAIN};
+    server_name ${DOMAIN} www.${DOMAIN};
 
     root ${WP_PATH};
     index index.php index.html index.htm;
@@ -170,10 +197,21 @@ server {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:/var/run/php/php${PHP_VERSION}-fpm.sock;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_AUTHORIZATION \$http_authorization;
+        fastcgi_cache_key \$scheme\$request_method\$host\$request_uri;
+        fastcgi_cache_bypass \$skip_cache;
+        fastcgi_no_cache \$skip_cache;
+        fastcgi_cache WORDPRESS;
+        fastcgi_cache_valid 200 301 302 10m;
+        fastcgi_cache_use_stale error timeout updating http_500 http_503;
+        add_header X-Cache \$upstream_cache_status always;
+        add_header X-Cache-Enabled "true" always;
+        add_header Cache-Control "public, max-age=600" always;
     }
 
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|otf|eot)\$ {
         expires max;
+        add_header Cache-Control "public, max-age=86400" always;
         log_not_found off;
     }
 }
@@ -184,6 +222,9 @@ if [ -f /etc/nginx/sites-enabled/default ]; then
   rm -f /etc/nginx/sites-enabled/default || true
 fi
 nginx -t && systemctl reload nginx
+# 创建 Nginx 缓存目录
+mkdir -p /var/cache/nginx/wordpress || true
+chown -R www-data:www-data /var/cache/nginx || true
 
 # ---------------- PHP 优化 ----------------
 echo "⚙️ 优化 PHP 配置..."
@@ -229,17 +270,28 @@ systemctl restart php${PHP_VERSION}-fpm
 
 # ---------------- WP-CLI 配置与安装 ----------------
 echo "🧩 通过 WP-CLI 配置并安装 WordPress..."
+if [ ! -f "${WP_PATH}/wp-config.php" ]; then
 $WP_CMD --path="$WP_PATH" config create --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --dbhost=localhost --skip-check --force --extra-php <<'PHP'
 define('FS_METHOD','direct');
 define('WP_MEMORY_LIMIT','512M');
+define('DISABLE_WP_CRON', true);
 PHP
+else
+  $WP_CMD --path="$WP_PATH" config set FS_METHOD direct --type=constant --raw --quiet || true
+  $WP_CMD --path="$WP_PATH" config set WP_MEMORY_LIMIT 512M --type=constant --raw --quiet || true
+  $WP_CMD --path="$WP_PATH" config set DISABLE_WP_CRON true --type=constant --raw --quiet || true
+fi
 
+if ! $WP_CMD --path="$WP_PATH" core is-installed >/dev/null 2>&1; then
 $WP_CMD --path="$WP_PATH" core install \
   --url="http://${DOMAIN}" \
   --title="My Site" \
   --admin_user="$ADMIN_USER" \
   --admin_password="$ADMIN_PASS" \
   --admin_email="$SSL_EMAIL"
+else
+  echo "ℹ️ 检测到 WordPress 已安装，跳过 core install。"
+fi
 
 # 固化固定链接结构
 $WP_CMD --path="$WP_PATH" option update permalink_structure "/%postname%/"
@@ -293,6 +345,12 @@ for SSL_CONF in "/etc/nginx/conf.d/${DOMAIN}.conf" "/etc/nginx/conf.d/${DOMAIN}-
   if [ -f "$SSL_CONF" ] && grep -q "listen 443" "$SSL_CONF"; then
     if ! grep -q "client_max_body_size" "$SSL_CONF"; then
       sed -i '/listen 443/a \    client_max_body_size 1024M;\n    fastcgi_read_timeout 1800;\n    fastcgi_connect_timeout 1800;\n    fastcgi_send_timeout 1800;\n    fastcgi_buffers 16 16k;\n    fastcgi_buffer_size 32k;\n    client_body_timeout 1800;\n    send_timeout 1800;' "$SSL_CONF"
+    fi
+    # 在 443 配置的 PHP 位置中注入缓存与授权头传递
+    if grep -q "location ~ \\\.php\\$" "$SSL_CONF"; then
+      if ! grep -q "X-Cache-Enabled" "$SSL_CONF"; then
+        sed -i '/location ~ \\\.php\\$ {/a \        fastcgi_param HTTP_AUTHORIZATION \$http_authorization;\n        fastcgi_cache_key \$scheme\$request_method\$host\$request_uri;\n        fastcgi_cache_bypass \$skip_cache;\n        fastcgi_no_cache \$skip_cache;\n        fastcgi_cache WORDPRESS;\n        fastcgi_cache_valid 200 301 302 10m;\n        fastcgi_cache_use_stale error timeout updating http_500 http_503;\n        add_header X-Cache \$upstream_cache_status always;\n        add_header X-Cache-Enabled "true" always;\n        add_header Cache-Control "public, max-age=600" always;' "$SSL_CONF"
+      fi
     fi
   fi
 done
