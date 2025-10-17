@@ -219,6 +219,23 @@ if [[ -n "${XML_FILE}" && -f "${XML_FILE}" ]]; then
   $WP_CMD --path="$WP_PATH" import "${XML_FILE}" --authors=create --skip="media" || $WP_CMD --path="$WP_PATH" import "${XML_FILE}" --authors=create || true
 fi
 
+# ---------------- 防火墙（开放 80/443） ----------------
+echo "🔓 开放 80/443 端口（UFW）..."
+if command -v ufw >/dev/null 2>&1; then
+  # 优先使用 Nginx Full 应用档案（一次性开放 80/443）
+  ufw allow 'Nginx Full' || { ufw allow 80/tcp || true; ufw allow 443/tcp || true; }
+  # 确保 SSH 不被阻断
+  ufw allow OpenSSH || ufw allow 22/tcp || true
+  ufw --force enable || true
+  ufw reload || true
+else
+  apt install -y ufw
+  ufw allow 'Nginx Full' || { ufw allow 80/tcp || true; ufw allow 443/tcp || true; }
+  ufw allow OpenSSH || ufw allow 22/tcp || true
+  ufw --force enable || true
+  ufw reload || true
+fi
+
 # ---------------- SSL（HTTPS） ----------------
 echo "🔐 申请并启用 SSL (Let’s Encrypt)..."
 certbot --nginx -d "${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || echo "⚠️ SSL 自动申请失败，请稍后重试"
