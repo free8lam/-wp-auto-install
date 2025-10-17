@@ -35,14 +35,21 @@ apt install -y \
   php${PHP_VERSION}-opcache imagemagick certbot python3-certbot-nginx
 
 # Imagick 扩展
-apt install -y php-imagick || { apt install -y php-pear php${PHP_VERSION}-dev libmagickwand-dev || true; printf "\n" | pecl install imagick || true; echo "extension=imagick" > /etc/php/${PHP_VERSION}/mods-available/imagick.ini || true; }
-phpenmod imagick || phpenmod -v ${PHP_VERSION} -s all imagick || true
+apt install -y php-imagick || { apt install -y php-pear php${PHP_VERSION}-dev libmagickwand-dev || true; printf "\n" | pecl install imagick || true; }
+# 如 mods-available 缺失，则手动创建并链接
+IMAGICK_MODS="/etc/php/${PHP_VERSION}/mods-available/imagick.ini"
+if [ ! -f "$IMAGICK_MODS" ]; then echo "extension=imagick" > "$IMAGICK_MODS"; fi
+phpenmod -v ${PHP_VERSION} -s all imagick || {
+  ln -sf "$IMAGICK_MODS" "/etc/php/${PHP_VERSION}/cli/conf.d/20-imagick.ini" || true
+  ln -sf "$IMAGICK_MODS" "/etc/php/${PHP_VERSION}/fpm/conf.d/20-imagick.ini" || true
+}
 systemctl restart php${PHP_VERSION}-fpm || true
 php -r 'echo "Imagick扩展:".(extension_loaded("imagick")?"已启用\n":"未启用\n");' || true
 
 # WP-CLI
 if ! command -v wp >/dev/null 2>&1; then curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x wp-cli.phar && mv wp-cli.phar /usr/local/bin/wp; fi
 WP_CMD="wp"; [ "$(id -u)" -eq 0 ] && WP_CMD="$WP_CMD --allow-root"
+WP_CMD_SAFE="$WP_CMD --skip-plugins --skip-themes"
 # 统一 WP-CLI PHP 版本并确保 mysqli 扩展可用
 PHP_BIN="$(command -v php${PHP_VERSION} || true)"
 if [ -z "$PHP_BIN" ]; then PHP_BIN="$(command -v php)"; fi
@@ -63,24 +70,24 @@ fi
 
 # 安装检测与修复模式
 REPAIR_MODE=0
-get_cfg() { ${WP_CMD} --path="${WP_PATH}" config get "$1" 2>/dev/null || true; }
+get_cfg() { ${WP_CMD_SAFE} --path="${WP_PATH}" config get "$1" 2>/dev/null || true; }
 is_installed=0
 if [ -f "${WP_PATH}/wp-config.php" ]; then is_installed=1; fi
-if ${WP_CMD} --path="${WP_PATH}" core is-installed >/dev/null 2>&1; then is_installed=1; fi
+if ${WP_CMD_SAFE} --path="${WP_PATH}" core is-installed >/dev/null 2>&1; then is_installed=1; fi
 if [ "$is_installed" -eq 1 ]; then
   REPAIR_MODE=1
   echo "检测到已安装的 WordPress，进入修复模式"
   CFG_DB_NAME="$(get_cfg DB_NAME)"; [ -n "$CFG_DB_NAME" ] && DB_NAME="$CFG_DB_NAME"
   CFG_DB_USER="$(get_cfg DB_USER)"; [ -n "$CFG_DB_USER" ] && DB_USER="$CFG_DB_USER"
   CFG_DB_PASSWORD="$(get_cfg DB_PASSWORD)"; [ -n "$CFG_DB_PASSWORD" ] && DB_PASSWORD="$CFG_DB_PASSWORD"
-  SITEURL="$(${WP_CMD} --path="${WP_PATH}" option get siteurl 2>/dev/null || ${WP_CMD} --path="${WP_PATH}" option get home 2>/dev/null || echo "")"
+  SITEURL="$(${WP_CMD_SAFE} --path="${WP_PATH}" option get siteurl 2>/dev/null || ${WP_CMD_SAFE} --path="${WP_PATH}" option get home 2>/dev/null || echo "")"
   if [ -z "${DOMAIN}" ] && [ -n "${SITEURL}" ]; then DOMAIN="$(echo "${SITEURL}" | awk -F[/:] '{print $4}')"; fi
 else
   echo "未检测到现有安装，进行全新安装"
 fi
 
 # 根据检测结果补齐交互输入（仅对缺失项提示）
-cfg_file() { local k="$1"; local f="${WP_PATH}/wp-config.php"; [ -f "$f" ] || return 0; sed -nE "s/.*define\(['\"]${k}['\"],\s*'([^']+)'\).*/\1/p" "$f"; }
+cfg_file() { local k="$1"; local f="${WP_PATH}/wp-config.php"; [ -f "$f" ] || return 0; sed -nE "s/.*define\(['\"]${k}['\"],\s*['\"]([^'\"]+)['\"]\).*/\1/p" "$f"; }
 # 优先从 wp-config.php 填充数据库参数，避免已安装环境重复输入
 [ -z "${DB_NAME}" ] && DB_NAME="$(cfg_file DB_NAME)"
 [ -z "${DB_USER}" ] && DB_USER="$(cfg_file DB_USER)"
@@ -129,18 +136,22 @@ mysql_try() {
   return 1
 }
 
-# 先创建库与用户并授权
-if ! mysql_try "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"; then
-  echo "无法创建数据库：请确认维护用户文件、sudo mysql或root密码有效。" >&2
-  exit 1
+# 仅当数据库参数齐全时才创建/授权，修复模式下缺失则跳过
+if [ -n "${DB_NAME}" ] && [ -n "${DB_USER}" ] && [ -n "${DB_PASSWORD}" ]; then
+  if ! mysql_try "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"; then
+    echo "无法创建数据库：请确认维护用户文件、sudo mysql或root密码有效。" >&2
+    exit 1
+  fi
+  mysql_try "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';" || {
+    mysql_try "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';" || { echo "无法创建/更新 MySQL 业务用户 '${DB_USER}'" >&2; exit 1; }
+  }
+  mysql_try "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;" || { echo "授予权限失败" >&2; exit 1; }
+else
+  echo "跳过数据库创建：未检测到完整的 DB_NAME/DB_USER/DB_PASSWORD（修复模式无需）。"
 fi
-mysql_try "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';" || {
-  mysql_try "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';" || { echo "无法创建/更新 MySQL 业务用户 '${DB_USER}'" >&2; exit 1; }
-}
-mysql_try "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;" || { echo "授予权限失败" >&2; exit 1; }
 
-# 如能以root登录，则统一插件为mysql_native_password（可选，不影响安装）
-if mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "SELECT 1;" >/dev/null 2>&1; then
+# 若 root 密码已知且可登录，则统一其认证插件为 mysql_native_password（仅在成功登录时执行）
+if [ -n "${MYSQL_ROOT_PASSWORD}" ] && mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "SELECT 1;" >/dev/null 2>&1; then
   mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}'; FLUSH PRIVILEGES;" || true
 fi
 
@@ -251,7 +262,11 @@ if ! "$PHP_BIN" -r 'exit(extension_loaded("mysqli")?0:1);'; then
   "$PHP_BIN" -m | egrep -i 'mysql|mysqli|pdo_mysql' || true
   exit 1
 fi
-"$PHP_BIN" -r '$h=getenv("DB_HOST"); $u=getenv("DB_USER"); $p=getenv("DB_PASSWORD"); $d=getenv("DB_NAME"); $m=@new mysqli($h,$u,$p,$d); if($m->connect_errno){fwrite(STDERR,"DB连接失败:".$m->connect_error."\n"); exit(1);} echo "DB连接正常\n";'
+if [ -n "${DB_NAME}" ] && [ -n "${DB_USER}" ] && [ -n "${DB_PASSWORD}" ]; then
+  "$PHP_BIN" -r '$h=getenv("DB_HOST")?:"localhost"; $u=getenv("DB_USER"); $p=getenv("DB_PASSWORD"); $d=getenv("DB_NAME"); $m=@new mysqli($h,$u,$p,$d); if($m->connect_errno){fwrite(STDERR,"DB连接失败:".$m->connect_error."\n"); exit(1);} echo "DB连接正常\n";'
+else
+  echo "跳过DB连接预检：缺少 DB_NAME/DB_USER/DB_PASSWORD（修复模式可跳过）"
+fi
 
 if ! ${WP_CMD} --path="${WP_PATH}" core is-installed >/dev/null 2>&1; then
 ${WP_CMD} --path="${WP_PATH}" core install \
