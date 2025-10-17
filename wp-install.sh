@@ -58,8 +58,24 @@ apt install -y \
   php${PHP_VERSION}-mysql php${PHP_VERSION}-curl php${PHP_VERSION}-gd \
   php${PHP_VERSION}-intl php${PHP_VERSION}-mbstring php${PHP_VERSION}-soap \
   php${PHP_VERSION}-xml php${PHP_VERSION}-zip php${PHP_VERSION}-xsl \
+  php${PHP_VERSION}-opcache \
   imagemagick
 apt install -y certbot python3-certbot-nginx
+
+# 尝试安装并启用 PHP Imagick 扩展（WordPress 站点健康推荐）
+echo "🧩 安装并启用 PHP Imagick 扩展..."
+if apt install -y php-imagick; then
+  phpenmod imagick || true
+else
+  echo "⚠️ apt 未能安装 php-imagick，尝试通过 PECL 构建..."
+  apt install -y php-pear php${PHP_VERSION}-dev libmagickwand-dev || true
+  # 非交互安装 imagick 扩展
+  printf "\n" | pecl install imagick || true
+  echo "extension=imagick" > /etc/php/${PHP_VERSION}/mods-available/imagick.ini || true
+  phpenmod imagick || true
+fi
+# 先测试 CLI 下是否已加载（FPM 稍后会统一重启）
+php -r 'echo "Imagick 扩展: ".(extension_loaded("imagick")?"已加载\n":"未加载\n");' || true
 
 # ---------------- 安装 WP-CLI ----------------
 if ! command -v wp &> /dev/null; then
@@ -129,6 +145,11 @@ client_max_body_size 1024M;
 fastcgi_read_timeout 1800;
 fastcgi_buffers 16 16k;
 fastcgi_buffer_size 32k;
+fastcgi_connect_timeout 1800;
+fastcgi_send_timeout 1800;
+client_body_timeout 1800;
+send_timeout 1800;
+server_tokens off;
 EOF
 
 # ---------------- Nginx 站点配置(80) ----------------
@@ -158,6 +179,10 @@ server {
 }
 EOF
 
+# 移除默认站点以避免冲突
+if [ -f /etc/nginx/sites-enabled/default ]; then
+  rm -f /etc/nginx/sites-enabled/default || true
+fi
 nginx -t && systemctl reload nginx
 
 # ---------------- PHP 优化 ----------------
@@ -171,10 +196,35 @@ for INI in /etc/php/${PHP_VERSION}/{fpm,cli}/php.ini; do
     sed -i "s/^max_input_time.*/max_input_time = 1800/" "$INI"
     grep -q "^max_input_vars" "$INI" || echo "max_input_vars = 10000" >> "$INI"
     grep -q "^upload_tmp_dir" "$INI" || echo "upload_tmp_dir = ${WP_PATH}/wp-content/tmp" >> "$INI"
+    # 安全性：禁用不安全路径信息
+    if grep -q "^cgi\.fix_pathinfo" "$INI"; then
+      sed -i "s/^cgi\.fix_pathinfo.*/cgi.fix_pathinfo=0/" "$INI"
+    else
+      echo "cgi.fix_pathinfo=0" >> "$INI"
+    fi
   else
     echo "⚠️ 配置文件不存在: $INI"
   fi
 done
+
+# 预创建上传临时目录，确保 FPM 重启前权限正确
+mkdir -p "${WP_PATH}/wp-content/tmp" || true
+chown -R www-data:www-data "${WP_PATH}/wp-content" || true
+chmod -R 775 "${WP_PATH}/wp-content" || true
+
+# OPcache 性能优化
+for OPC in /etc/php/${PHP_VERSION}/fpm/conf.d/zz-opcache.ini /etc/php/${PHP_VERSION}/cli/conf.d/zz-opcache.ini; do
+  cat > "$OPC" <<OPC
+opcache.enable=1
+opcache.enable_cli=1
+opcache.memory_consumption=256
+opcache.interned_strings_buffer=16
+opcache.max_accelerated_files=10000
+opcache.validate_timestamps=1
+opcache.revalidate_freq=2
+OPC
+done
+phpenmod opcache || true
 systemctl restart php${PHP_VERSION}-fpm
 
 # ---------------- WP-CLI 配置与安装 ----------------
@@ -195,10 +245,8 @@ $WP_CMD --path="$WP_PATH" core install \
 $WP_CMD --path="$WP_PATH" option update permalink_structure "/%postname%/"
 $WP_CMD --path="$WP_PATH" rewrite flush --hard
 
-# 上传目录权限
-mkdir -p "$WP_PATH/wp-content/uploads" "$WP_PATH/wp-content/tmp" || true
-chown -R www-data:www-data "$WP_PATH/wp-content" || true
-chmod -R 775 "$WP_PATH/wp-content" || true
+# 上传目录权限（tmp 已预创建，此处补充 uploads）
+mkdir -p "$WP_PATH/wp-content/uploads" || true
 
 # ---------------- 可选：安装并激活主题 ----------------
 if [ -n "${THEME_ZIP_PATH}" ] && [ -f "${THEME_ZIP_PATH}" ]; then
@@ -244,7 +292,7 @@ certbot --nginx -d "${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || ec
 for SSL_CONF in "/etc/nginx/conf.d/${DOMAIN}.conf" "/etc/nginx/conf.d/${DOMAIN}-le-ssl.conf"; do
   if [ -f "$SSL_CONF" ] && grep -q "listen 443" "$SSL_CONF"; then
     if ! grep -q "client_max_body_size" "$SSL_CONF"; then
-      sed -i '/listen 443/a \    client_max_body_size 1024M;\n    fastcgi_read_timeout 1800;' "$SSL_CONF"
+      sed -i '/listen 443/a \    client_max_body_size 1024M;\n    fastcgi_read_timeout 1800;\n    fastcgi_connect_timeout 1800;\n    fastcgi_send_timeout 1800;\n    fastcgi_buffers 16 16k;\n    fastcgi_buffer_size 32k;\n    client_body_timeout 1800;\n    send_timeout 1800;' "$SSL_CONF"
     fi
   fi
 done
@@ -265,7 +313,3 @@ echo "✅ 数据库: ${DB_NAME}"
 echo "👤 数据库用户: ${DB_USER}"
 echo "👑 管理员: ${ADMIN_USER}"
 echo "==============================================="
-echo "提示：
-- 如后台上传主题仍提示链接过期，检查 Nginx 全局 \"client_max_body_size\" 与 PHP‑FPM是否已重启。
-- 可用 WP‑CLI 安装主题： wp theme install /path/to/zhuti.zip --activate --path=${WP_PATH}
-- 固定链接与首页设置可在后台或主题激活后自动完成。"
