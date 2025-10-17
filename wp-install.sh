@@ -41,6 +41,23 @@ php -r 'echo "Imagick扩展:".(extension_loaded("imagick")?"已启用\n":"未启
 # WP-CLI
 if ! command -v wp >/dev/null 2>&1; then curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x wp-cli.phar && mv wp-cli.phar /usr/local/bin/wp; fi
 WP_CMD="wp"; [ "$(id -u)" -eq 0 ] && WP_CMD="$WP_CMD --allow-root"
+# 统一 WP-CLI PHP 版本并确保 mysqli 扩展可用
+PHP_BIN="$(command -v php${PHP_VERSION} || true)"
+if [ -z "$PHP_BIN" ]; then PHP_BIN="$(command -v php)"; fi
+export WP_CLI_PHP="$PHP_BIN"
+update-alternatives --set php "$PHP_BIN" >/dev/null 2>&1 || true
+if ! "$PHP_BIN" -r 'exit(extension_loaded("mysqli")?0:1);'; then
+  apt install -y "php${PHP_VERSION}-mysql" || true
+  phpenmod mysqli || true
+  phpenmod pdo_mysql || true
+  phpenmod mysqlnd || true
+  systemctl restart "php${PHP_VERSION}-fpm" || true
+  if ! "$PHP_BIN" -r 'exit(extension_loaded("mysqli")?0:1);'; then
+    echo "错误：CLI 环境缺少 mysqli 扩展，无法继续 WP 安装。" >&2
+    "$PHP_BIN" -m || true
+    exit 1
+  fi
+fi
 
 # Swap
 if ! swapon --show | grep -q '^'; then fallocate -l ${SWAP_SIZE} /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab; fi
@@ -113,6 +130,10 @@ for INI in /etc/php/${PHP_VERSION}/{fpm,cli}/php.ini; do [ -f "$INI" ] || contin
   grep -q "^upload_tmp_dir" "$INI" && sed -i -E "s|^upload_tmp_dir.*|upload_tmp_dir = ${WP_PATH}/wp-content/tmp|" "$INI" || echo "upload_tmp_dir = ${WP_PATH}/wp-content/tmp" >> "$INI";
   grep -q "^cgi\.fix_pathinfo" "$INI" && sed -i -E "s|^cgi\.fix_pathinfo.*|cgi.fix_pathinfo=0|" "$INI" || echo "cgi.fix_pathinfo=0" >> "$INI";
 done
+# 确保 FPM 请求超时配置存在
+if ! grep -q "^request_terminate_timeout" "/etc/php/${PHP_VERSION}/fpm/pool.d/www.conf"; then
+  echo "request_terminate_timeout = 1800" >> "/etc/php/${PHP_VERSION}/fpm/pool.d/www.conf"
+fi
 sed -i -E "s|^;?request_terminate_timeout.*|request_terminate_timeout = 1800|" /etc/php/${PHP_VERSION}/fpm/pool.d/www.conf || true
 
 # OPcache
@@ -141,6 +162,16 @@ else
   ${WP_CMD} --path="${WP_PATH}" config set WP_MEMORY_LIMIT 512M --type=constant --raw --quiet || true
   ${WP_CMD} --path="${WP_PATH}" config set DISABLE_WP_CRON true --type=constant --raw --quiet || true
 fi
+
+# 预检：确认 PHP 模块与数据库连接可用（避免安装阶段失败）
+export DB_HOST="localhost"
+export DB_NAME DB_USER DB_PASSWORD
+if ! "$PHP_BIN" -r 'exit(extension_loaded("mysqli")?0:1);'; then
+  echo "错误：CLI 缺少 mysqli 扩展" >&2
+  "$PHP_BIN" -m | egrep -i 'mysql|mysqli|pdo_mysql' || true
+  exit 1
+fi
+"$PHP_BIN" -r '$h=getenv("DB_HOST"); $u=getenv("DB_USER"); $p=getenv("DB_PASSWORD"); $d=getenv("DB_NAME"); $m=@new mysqli($h,$u,$p,$d); if($m->connect_errno){fwrite(STDERR,"DB连接失败:".$m->connect_error."\n"); exit(1);} echo "DB连接正常\n";'
 
 if ! ${WP_CMD} --path="${WP_PATH}" core is-installed >/dev/null 2>&1; then
 ${WP_CMD} --path="${WP_PATH}" core install \
