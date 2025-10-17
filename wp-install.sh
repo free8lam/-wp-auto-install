@@ -35,7 +35,9 @@ apt install -y \
   php${PHP_VERSION}-opcache imagemagick certbot python3-certbot-nginx
 
 # Imagick 扩展
-apt install -y php-imagick || { apt install -y php-pear php${PHP_VERSION}-dev libmagickwand-dev || true; printf "\n" | pecl install imagick || true; echo "extension=imagick" > /etc/php/${PHP_VERSION}/mods-available/imagick.ini || true; phpenmod imagick || true; }
+apt install -y php-imagick || { apt install -y php-pear php${PHP_VERSION}-dev libmagickwand-dev || true; printf "\n" | pecl install imagick || true; echo "extension=imagick" > /etc/php/${PHP_VERSION}/mods-available/imagick.ini || true; }
+phpenmod imagick || phpenmod -v ${PHP_VERSION} -s all imagick || true
+systemctl restart php${PHP_VERSION}-fpm || true
 php -r 'echo "Imagick扩展:".(extension_loaded("imagick")?"已启用\n":"未启用\n");' || true
 
 # WP-CLI
@@ -59,35 +61,59 @@ if ! "$PHP_BIN" -r 'exit(extension_loaded("mysqli")?0:1);'; then
   fi
 fi
 
+# 安装检测与修复模式
+REPAIR_MODE=0
+get_cfg() { ${WP_CMD} --path="${WP_PATH}" config get "$1" 2>/dev/null || true; }
+is_installed=0
+if [ -f "${WP_PATH}/wp-config.php" ]; then is_installed=1; fi
+if ${WP_CMD} --path="${WP_PATH}" core is-installed >/dev/null 2>&1; then is_installed=1; fi
+if [ "$is_installed" -eq 1 ]; then
+  REPAIR_MODE=1
+  echo "检测到已安装的 WordPress，进入修复模式"
+  CFG_DB_NAME="$(get_cfg DB_NAME)"; [ -n "$CFG_DB_NAME" ] && DB_NAME="$CFG_DB_NAME"
+  CFG_DB_USER="$(get_cfg DB_USER)"; [ -n "$CFG_DB_USER" ] && DB_USER="$CFG_DB_USER"
+  CFG_DB_PASSWORD="$(get_cfg DB_PASSWORD)"; [ -n "$CFG_DB_PASSWORD" ] && DB_PASSWORD="$CFG_DB_PASSWORD"
+  SITEURL="$(${WP_CMD} --path="${WP_PATH}" option get siteurl 2>/dev/null || ${WP_CMD} --path="${WP_PATH}" option get home 2>/dev/null || echo "")"
+  if [ -z "${DOMAIN}" ] && [ -n "${SITEURL}" ]; then DOMAIN="$(echo "${SITEURL}" | awk -F[/:] '{print $4}')"; fi
+else
+  echo "未检测到现有安装，进行全新安装"
+fi
+
 # Swap
 if ! swapon --show | grep -q '^'; then fallocate -l ${SWAP_SIZE} /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab; fi
 
-# MySQL root 与库/用户
+# MySQL 数据库与用户创建（不强制修改 root，多重登录回退）
 systemctl start mysql || true
 MYSQL_MAINT="/etc/mysql/debian.cnf"
-# 优先使用维护用户设置 root 密码与插件，兼容已存在密码的场景
-if [ -r "$MYSQL_MAINT" ]; then
-  mysql --defaults-file="$MYSQL_MAINT" -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}'; FLUSH PRIVILEGES;" || true
-else
-  # 尝试通过本机socket或无密码连接（适用于 auth_socket）
-  sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}'; FLUSH PRIVILEGES;" || \
-  mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}'; FLUSH PRIVILEGES;" || true
-fi
-# 测试 root 登录，如失败则使用维护用户执行后续数据库操作
-if ! mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "SELECT 1;" >/dev/null 2>&1; then
+
+mysql_try() {
+  local sql="$1"
+  # 1) 维护用户（debian-sys-maint）
   if [ -r "$MYSQL_MAINT" ]; then
-    echo "使用维护用户配置数据库与权限..."
-    mysql --defaults-file="$MYSQL_MAINT" -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-    mysql --defaults-file="$MYSQL_MAINT" -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';"
-    mysql --defaults-file="$MYSQL_MAINT" -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;"
-  else
-    echo "MySQL root配置失败，且无法使用维护用户。请确认 root 密码或认证插件。" >&2
-    exit 1
+    mysql --defaults-file="$MYSQL_MAINT" -e "$sql" && return 0
   fi
-else
-  mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-  mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';"
-  mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;"
+  # 2) 本机root（auth_socket/unix_socket）
+  if command -v mysql >/dev/null 2>&1; then
+    sudo mysql -e "$sql" && return 0
+  fi
+  # 3) root + 你输入的密码（若已设置）
+  mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "$sql" && return 0
+  return 1
+}
+
+# 先创建库与用户并授权
+if ! mysql_try "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"; then
+  echo "无法创建数据库：请确认维护用户文件、sudo mysql或root密码有效。" >&2
+  exit 1
+fi
+mysql_try "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';" || {
+  mysql_try "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';" || { echo "无法创建/更新 MySQL 业务用户 '${DB_USER}'" >&2; exit 1; }
+}
+mysql_try "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;" || { echo "授予权限失败" >&2; exit 1; }
+
+# 如能以root登录，则统一插件为mysql_native_password（可选，不影响安装）
+if mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "SELECT 1;" >/dev/null 2>&1; then
+  mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}'; FLUSH PRIVILEGES;" || true
 fi
 
 # WordPress 文件
@@ -119,6 +145,7 @@ map "$no_cache_cookie$no_cache_uri$no_cache_method$no_cache_query" $skip_cache {
 NG
 
 # Nginx 站点配置(80)
+if [ -n "${DOMAIN}" ]; then
 cat > /etc/nginx/conf.d/${DOMAIN}.conf <<EOF
 server {
   listen 80; server_name ${DOMAIN} www.${DOMAIN};
@@ -134,6 +161,7 @@ server {
   location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|otf|eot)\$ { expires max; add_header Cache-Control "public, max-age=86400" always; log_not_found off; }
 }
 EOF
+fi
 
 [ -f /etc/nginx/sites-enabled/default ] && rm -f /etc/nginx/sites-enabled/default || true
 mkdir -p /var/cache/nginx/wordpress && chown -R ${FPM_USER}:${FPM_GROUP} /var/cache/nginx || true
@@ -219,6 +247,7 @@ ufw --force enable || true
 ufw reload || true
 
 # SSL 与 443 加固
+if [ -n "${DOMAIN}" ]; then
 certbot --nginx -d "${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || echo "SSL申请失败，稍后重试"
 for SSL_CONF in "/etc/nginx/conf.d/${DOMAIN}.conf" "/etc/nginx/conf.d/${DOMAIN}-le-ssl.conf"; do
   if [ -f "$SSL_CONF" ] && grep -q "listen 443" "$SSL_CONF"; then
@@ -226,11 +255,14 @@ for SSL_CONF in "/etc/nginx/conf.d/${DOMAIN}.conf" "/etc/nginx/conf.d/${DOMAIN}-
     grep -q "X-Cache-Enabled" "$SSL_CONF" || sed -i '/location ~ \\\.php\\\$ {/a \\        fastcgi_param HTTP_AUTHORIZATION \\$http_authorization;\\n        fastcgi_cache_key \\$scheme\\$request_method\\$host\\$request_uri;\\n        fastcgi_cache_bypass \\$skip_cache;\\n        fastcgi_no_cache \\$skip_cache;\\n        fastcgi_cache WORDPRESS;\\n        fastcgi_cache_valid 200 301 302 10m;\\n        fastcgi_cache_use_stale error timeout updating http_500 http_503;\\n        add_header X-Cache \\$upstream_cache_status always;\\n        add_header Cache-Control "public, max-age=600" always;' "$SSL_CONF"
   fi
 done
+fi
 nginx -t && systemctl reload nginx || true
 
 # 切换站点到 https
+if [ -n "${DOMAIN}" ]; then
 ${WP_CMD} --path="${WP_PATH}" option update home "https://${DOMAIN}" || true
 ${WP_CMD} --path="${WP_PATH}" option update siteurl "https://${DOMAIN}" || true
+fi
 systemctl restart php${PHP_VERSION}-fpm || true
 
 # 输出
