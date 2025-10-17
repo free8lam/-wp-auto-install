@@ -3,18 +3,18 @@ set -euo pipefail
 DEBIAN_FRONTEND=noninteractive
 trap 'echo "安装失败：行 $LINENO" >&2' ERR
 
-# 交互输入
-read -p "MySQL 数据库名: " DB_NAME
-read -p "MySQL 用户名: " DB_USER
-read -s -p "MySQL 用户密码: " DB_PASSWORD; echo
-read -p "MySQL root 密码: " MYSQL_ROOT_PASSWORD
-read -p "域名(如 example.com): " DOMAIN
-read -p "SSL 邮箱: " SSL_EMAIL
-read -p "WP 管理员用户名: " ADMIN_USER
-read -s -p "WP 管理员密码: " ADMIN_PASS; echo
-read -p "(可选) XML 文件路径: " XML_FILE
-read -p "(可选) 主题 ZIP URL: " THEME_ZIP_URL
-read -p "(可选) 主题 ZIP 本地路径: " THEME_ZIP_PATH
+# 交互输入（先占位，稍后根据检测补齐；支持环境变量预置）
+DB_NAME="${DB_NAME:-}"
+DB_USER="${DB_USER:-}"
+DB_PASSWORD="${DB_PASSWORD:-}"
+MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"
+DOMAIN="${DOMAIN:-}"
+SSL_EMAIL="${SSL_EMAIL:-}"
+ADMIN_USER="${ADMIN_USER:-}"
+ADMIN_PASS="${ADMIN_PASS:-}"
+XML_FILE="${XML_FILE:-}"
+THEME_ZIP_URL="${THEME_ZIP_URL:-}"
+THEME_ZIP_PATH="${THEME_ZIP_PATH:-}"
 
 WP_PATH="/var/www/wordpress"
 PHP_VERSION="8.3"
@@ -79,6 +79,34 @@ else
   echo "未检测到现有安装，进行全新安装"
 fi
 
+# 根据检测结果补齐交互输入（仅对缺失项提示）
+cfg_file() { local k="$1"; local f="${WP_PATH}/wp-config.php"; [ -f "$f" ] || return 0; sed -nE "s/.*define\(['\"]${k}['\"],\s*'([^']+)'\).*/\1/p" "$f"; }
+# 优先从 wp-config.php 填充数据库参数，避免已安装环境重复输入
+[ -z "${DB_NAME}" ] && DB_NAME="$(cfg_file DB_NAME)"
+[ -z "${DB_USER}" ] && DB_USER="$(cfg_file DB_USER)"
+[ -z "${DB_PASSWORD}" ] && DB_PASSWORD="$(cfg_file DB_PASSWORD)"
+
+if [ "$is_installed" -eq 0 ]; then
+  # 全新安装：仅对缺失项进行提示
+  [ -z "${DB_NAME}" ] && read -p "MySQL 数据库名: " DB_NAME
+  [ -z "${DB_USER}" ] && read -p "MySQL 用户名: " DB_USER
+  if [ -z "${DB_PASSWORD}" ]; then read -s -p "MySQL 用户密码: " DB_PASSWORD; echo; fi
+  # root 密码可留空，仅用于某些环境的第三回退
+  if [ -z "${MYSQL_ROOT_PASSWORD}" ]; then read -p "MySQL root 密码(留空则跳过): " MYSQL_ROOT_PASSWORD; fi
+  [ -z "${DOMAIN}" ] && read -p "域名(如 example.com): " DOMAIN
+  [ -z "${SSL_EMAIL}" ] && read -p "SSL 邮箱: " SSL_EMAIL
+  [ -z "${ADMIN_USER}" ] && read -p "WP 管理员用户名: " ADMIN_USER
+  if [ -z "${ADMIN_PASS}" ]; then read -s -p "WP 管理员密码: " ADMIN_PASS; echo; fi
+  # 可选项（仅全新安装时询问一次）
+  [ -z "${XML_FILE}" ] && read -p "(可选) XML 文件路径: " XML_FILE
+  [ -z "${THEME_ZIP_URL}" ] && read -p "(可选) 主题 ZIP URL: " THEME_ZIP_URL
+  [ -z "${THEME_ZIP_PATH}" ] && read -p "(可选) 主题 ZIP 本地路径: " THEME_ZIP_PATH
+else
+  # 修复模式：不再询问已存在信息，仅在缺失且必要时处理域名
+  [ -z "${DOMAIN}" ] && [ -n "${SITEURL}" ] && DOMAIN="$(echo "${SITEURL}" | awk -F[/:] '{print $4}')"
+  # DOMAIN 缺失则跳过 SSL 与 URL 更新
+fi
+
 # Swap
 if ! swapon --show | grep -q '^'; then fallocate -l ${SWAP_SIZE} /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab; fi
 
@@ -97,7 +125,7 @@ mysql_try() {
     sudo mysql -e "$sql" && return 0
   fi
   # 3) root + 你输入的密码（若已设置）
-  mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "$sql" && return 0
+  if [ -n "${MYSQL_ROOT_PASSWORD}" ]; then mysql -u root -p"${MYSQL_ROOT_PASSWORD}" -e "$sql" && return 0; fi
   return 1
 }
 
@@ -206,8 +234,12 @@ define('WP_MEMORY_LIMIT','512M');
 define('DISABLE_WP_CRON', true);
 PHP
 else
-  ${WP_CMD} --path="${WP_PATH}" config set FS_METHOD direct --type=constant --raw --quiet || true
-  ${WP_CMD} --path="${WP_PATH}" config set WP_MEMORY_LIMIT 512M --type=constant --raw --quiet || true
+  # 纠正 wp-config.php 中可能存在的未加引号常量（由旧脚本或错误参数产生）
+  sed -i -E "s|define\(\s*'FS_METHOD'\s*,\s*direct\s*\)|define('FS_METHOD','direct')|g" "${WP_PATH}/wp-config.php" || true
+  sed -i -E "s|define\(\s*'WP_MEMORY_LIMIT'\s*,\s*([0-9]+M)\s*\)|define('WP_MEMORY_LIMIT','\\1')|g" "${WP_PATH}/wp-config.php" || true
+  # 正确写入：字符串不使用 --raw，布尔值才使用 --raw
+  ${WP_CMD} --path="${WP_PATH}" config set FS_METHOD direct --type=constant --quiet || true
+  ${WP_CMD} --path="${WP_PATH}" config set WP_MEMORY_LIMIT 512M --type=constant --quiet || true
   ${WP_CMD} --path="${WP_PATH}" config set DISABLE_WP_CRON true --type=constant --raw --quiet || true
 fi
 
