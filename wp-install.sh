@@ -9,6 +9,15 @@ set -euo pipefail
 
 DEBIAN_FRONTEND=noninteractive
 
+# 必须以 root 运行
+if [ "$(id -u)" -ne 0 ]; then
+  echo "❌ 请用 root 用户运行：sudo -E bash $0" >&2
+  exit 1
+fi
+
+# 打印错误行号，便于定位
+trap 'echo "❌ 安装失败（行 $LINENO）。请检查上方输出。" >&2' ERR
+
 # === 用户输入 ===
 read -p "请输入 MySQL 数据库名: " DB_NAME
 read -p "请输入 MySQL 用户名: " DB_USER
@@ -33,8 +42,17 @@ echo "🔄 更新系统..."
 apt update -y && apt upgrade -y
 
 # ---------------- 安装依赖 ----------------
-echo "📦 安装 Nginx、MySQL、PHP 及扩展..."
+echo "📦 安装 Nginx、MySQL、基础工具..."
 apt install -y nginx mysql-server curl wget unzip software-properties-common || true
+
+# 确保 PHP 8.3 软件源可用（若系统默认无 8.3，则添加 PPA）
+if ! apt-cache search "php${PHP_VERSION}-fpm" | grep -q "php${PHP_VERSION}-fpm"; then
+  echo "📦 添加 PHP PPA 仓库..."
+  add-apt-repository -y ppa:ondrej/php
+  apt update -y
+fi
+
+echo "📦 安装 PHP 8.3 及扩展..."
 apt install -y \
   php${PHP_VERSION}-fpm php${PHP_VERSION}-cli \
   php${PHP_VERSION}-mysql php${PHP_VERSION}-curl php${PHP_VERSION}-gd \
@@ -152,6 +170,7 @@ for INI in /etc/php/${PHP_VERSION}/{fpm,cli}/php.ini; do
     sed -i "s/^max_execution_time.*/max_execution_time = 1800/" "$INI"
     sed -i "s/^max_input_time.*/max_input_time = 1800/" "$INI"
     grep -q "^max_input_vars" "$INI" || echo "max_input_vars = 10000" >> "$INI"
+    grep -q "^upload_tmp_dir" "$INI" || echo "upload_tmp_dir = ${WP_PATH}/wp-content/tmp" >> "$INI"
   else
     echo "⚠️ 配置文件不存在: $INI"
   fi
@@ -203,6 +222,20 @@ fi
 # ---------------- SSL（HTTPS） ----------------
 echo "🔐 申请并启用 SSL (Let’s Encrypt)..."
 certbot --nginx -d "${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || echo "⚠️ SSL 自动申请失败，请稍后重试"
+
+# 同步 HTTPS 443 站点上传/超时限制（若 Certbot 新增了 443 server 块）
+for SSL_CONF in "/etc/nginx/conf.d/${DOMAIN}.conf" "/etc/nginx/conf.d/${DOMAIN}-le-ssl.conf"; do
+  if [ -f "$SSL_CONF" ] && grep -q "listen 443" "$SSL_CONF"; then
+    if ! grep -q "client_max_body_size" "$SSL_CONF"; then
+      sed -i '/listen 443/a \    client_max_body_size 1024M;\n    fastcgi_read_timeout 1800;' "$SSL_CONF"
+    fi
+  fi
+done
+nginx -t && systemctl reload nginx || true
+
+# 将站点地址切换为 https，避免后台操作混用 http 导致 nonce 问题
+$WP_CMD --path="$WP_PATH" option update home "https://${DOMAIN}" || true
+$WP_CMD --path="$WP_PATH" option update siteurl "https://${DOMAIN}" || true
 
 # 再次重启 PHP-FPM，确保一切生效
 systemctl restart php${PHP_VERSION}-fpm || true
