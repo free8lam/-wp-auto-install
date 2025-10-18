@@ -70,7 +70,8 @@ phpenmod -v ${PHP_VERSION} -s all imagick || {
   ln -sf "$IMAGICK_MODS" "/etc/php/${PHP_VERSION}/fpm/conf.d/20-imagick.ini" || true
 }
 systemctl restart php${PHP_VERSION}-fpm || true
-php -r 'echo "Imagick扩展:".(extension_loaded("imagick")?"已启用\n":"未启用\n");' || true
+PHP_BIN_EARLY="$(command -v php${PHP_VERSION} || command -v php || true)"; [ -z "$PHP_BIN_EARLY" ] && PHP_BIN_EARLY="php"
+"$PHP_BIN_EARLY" -r 'echo "Imagick扩展:".(extension_loaded("imagick")?"已启用\n":"未启用\n");' || true
 
 # WP-CLI
 if ! command -v wp >/dev/null 2>&1; then curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x wp-cli.phar && mv wp-cli.phar /usr/local/bin/wp; fi
@@ -275,9 +276,9 @@ else
   sed -i -E "s|define\(\s*'FS_METHOD'\s*,\s*direct\s*\)|define('FS_METHOD','direct')|g" "${WP_PATH}/wp-config.php" || true
   sed -i -E "s|define\(\s*'WP_MEMORY_LIMIT'\s*,\s*([0-9]+M)\s*\)|define('WP_MEMORY_LIMIT','\\1')|g" "${WP_PATH}/wp-config.php" || true
   # 正确写入：字符串不使用 --raw，布尔值才使用 --raw
-  ${WP_CMD} --path="${WP_PATH}" config set FS_METHOD direct --type=constant --quiet || true
-  ${WP_CMD} --path="${WP_PATH}" config set WP_MEMORY_LIMIT 512M --type=constant --quiet || true
-  ${WP_CMD} --path="${WP_PATH}" config set DISABLE_WP_CRON true --type=constant --raw --quiet || true
+  ${WP_CMD_SAFE} --path="${WP_PATH}" config set FS_METHOD direct --type=constant --quiet || true
+${WP_CMD_SAFE} --path="${WP_PATH}" config set WP_MEMORY_LIMIT 512M --type=constant --quiet || true
+${WP_CMD_SAFE} --path="${WP_PATH}" config set DISABLE_WP_CRON true --type=constant --raw --quiet || true
 fi
 
 # 预检：确认 PHP 模块与数据库连接可用（避免安装阶段失败）
@@ -294,13 +295,19 @@ else
   echo "跳过DB连接预检：缺少 DB_NAME/DB_USER/DB_PASSWORD（修复模式可跳过）"
 fi
 
-if ! ${WP_CMD} --path="${WP_PATH}" core is-installed >/dev/null 2>&1; then
-${WP_CMD} --path="${WP_PATH}" core install \
-  --url="http://${DOMAIN}" --title="My Site" \
-  --admin_user="${ADMIN_USER}" --admin_password="${ADMIN_PASS}" --admin_email="${SSL_EMAIL}"
+# 仅在未安装时才执行核心安装；修复模式绝不触发该步骤
+if [ "$is_installed" -eq 0 ]; then
+  if [ -z "${DOMAIN}" ] || [ -z "${ADMIN_USER}" ] || [ -z "${ADMIN_PASS}" ] || [ -z "${SSL_EMAIL}" ]; then
+    echo "错误：缺少 DOMAIN/ADMIN_USER/ADMIN_PASS/SSL_EMAIL，无法执行全新安装。" >&2
+    echo "请提供这些参数或通过交互输入补齐后重试。" >&2
+    exit 1
+  fi
+  ${WP_CMD_SAFE} --path="${WP_PATH}" core install \
+    --url="http://${DOMAIN}" --title="My Site" \
+    --admin_user="${ADMIN_USER}" --admin_password="${ADMIN_PASS}" --admin_email="${SSL_EMAIL}"
 fi
-${WP_CMD} --path="${WP_PATH}" option update permalink_structure "/%postname%/" || true
-${WP_CMD} --path="${WP_PATH}" rewrite flush --hard || true
+${WP_CMD_SAFE} --path="${WP_PATH}" option update permalink_structure "/%postname%/" || true
+${WP_CMD_SAFE} --path="${WP_PATH}" rewrite flush --hard || true
 
 # 主题安装（可选）
 if [ -n "${THEME_ZIP_PATH}" ] && [ -f "${THEME_ZIP_PATH}" ]; then ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_PATH}" --activate || true; elif [ -n "${THEME_ZIP_URL}" ]; then ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_URL}" --activate || true; fi
