@@ -259,6 +259,7 @@ if [ -n "${DOMAIN}" ]; then
 cat > /etc/nginx/conf.d/${DOMAIN}.conf <<EOF
 server {
   listen 80; server_name ${DOMAIN} www.${DOMAIN};
+  if (\$host = "www.${DOMAIN}") { return 301 https://${DOMAIN}\$request_uri; }
   root ${WP_PATH}; index index.php index.html index.htm;
   location / { try_files \$uri \$uri/ /index.php?\$args; }
   location ~ \.php\$ {
@@ -383,11 +384,12 @@ ufw reload || true
 
 # SSL 与 443 加固
 if [ -n "${DOMAIN}" ]; then
-certbot --nginx -d "${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || echo "SSL申请失败，稍后重试"
+certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || echo "SSL申请失败，稍后重试"
 for SSL_CONF in "/etc/nginx/conf.d/${DOMAIN}.conf" "/etc/nginx/conf.d/${DOMAIN}-le-ssl.conf"; do
   if [ -f "$SSL_CONF" ] && grep -q "listen 443" "$SSL_CONF"; then
     grep -q "client_max_body_size" "$SSL_CONF" || sed -i '/listen 443/a \\    client_max_body_size 1024M;\\n    fastcgi_read_timeout 1800;\\n    fastcgi_connect_timeout 1800;\\n    fastcgi_send_timeout 1800;\\n    client_body_timeout 1800;\\n    send_timeout 1800;' "$SSL_CONF"
-    grep -q "X-Cache-Enabled" "$SSL_CONF" || sed -i '/location ~ \\\.php\\\$ {/a \\        fastcgi_param HTTP_AUTHORIZATION \\$http_authorization;\\n        fastcgi_cache_key \\$scheme\\$request_method\\$host\\$request_uri;\\n        fastcgi_cache_bypass \\$skip_cache;\\n        fastcgi_no_cache \\$skip_cache;\\n        fastcgi_cache WORDPRESS;\\n        fastcgi_cache_valid 200 301 302 10m;\\n        fastcgi_cache_use_stale error timeout updating http_500 http_503;\\n        add_header X-Cache \\$upstream_cache_status always;\\n        add_header Cache-Control "public, max-age=600" always;' "$SSL_CONF"
+    grep -q "X-Cache-Enabled" "$SSL_CONF" || sed -i '/location ~ \\\.php\\\$ {/a \\        fastcgi_param HTTP_AUTHORIZATION \\\$http_authorization;\\n        fastcgi_cache_key \\\$scheme\\$request_method\\$host\\$request_uri;\\n        fastcgi_cache_bypass \\\$skip_cache;\\n        fastcgi_no_cache \\\$skip_cache;\\n        fastcgi_cache WORDPRESS;\\n        fastcgi_cache_valid 200 301 302 10m;\\n        fastcgi_cache_use_stale error timeout updating http_500 http_503;\\n        add_header X-Cache \\\$upstream_cache_status always;\\n        add_header Cache-Control "public, max-age=600" always;' "$SSL_CONF"
+    grep -q "if (\\$host = www.${DOMAIN})" "$SSL_CONF" || sed -i '/server_name/a \\    if (\\$host = www.${DOMAIN}) { return 301 https://${DOMAIN}\\$request_uri; }' "$SSL_CONF"
   fi
 done
 fi
