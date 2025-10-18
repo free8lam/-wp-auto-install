@@ -302,7 +302,10 @@ if [ "$is_installed" -eq 0 ]; then
   fi
   ${WP_CMD_SAFE} --path="${WP_PATH}" core install \
     --url="http://${DOMAIN}" --title="My Site" \
-    --admin_user="${ADMIN_USER}" --admin_password="${ADMIN_PASS}" --admin_email="${SSL_EMAIL}"
+    --admin_user="${ADMIN_USER}" --admin_password="${ADMIN_PASS}" --admin_email="${SSL_EMAIL}" && {
+      is_installed=1
+      SITEURL="http://${DOMAIN}"
+    }
 fi
 if [ "$is_installed" -eq 1 ]; then
   ${WP_CMD_SAFE} --path="${WP_PATH}" option update permalink_structure "/%postname%/" || true
