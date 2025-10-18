@@ -314,6 +314,7 @@ ${WP_CMD} --path="${WP_PATH}" config create --dbname="${DB_NAME}" --dbuser="${DB
 define('FS_METHOD','direct');
 define('WP_MEMORY_LIMIT','512M');
 define('DISABLE_WP_CRON', true);
+define('FORCE_SSL_ADMIN', true);
 PHP
 else
   # 纠正 wp-config.php 中可能存在的未加引号常量（由旧脚本或错误参数产生）
@@ -323,6 +324,7 @@ else
   ${WP_CMD_SAFE} --path="${WP_PATH}" config set FS_METHOD direct --type=constant --quiet || true
 ${WP_CMD_SAFE} --path="${WP_PATH}" config set WP_MEMORY_LIMIT 512M --type=constant --quiet || true
 ${WP_CMD_SAFE} --path="${WP_PATH}" config set DISABLE_WP_CRON true --type=constant --raw --quiet || true
+${WP_CMD_SAFE} --path="${WP_PATH}" config set FORCE_SSL_ADMIN true --type=constant --raw --quiet || true
 fi
 
 # 预检：确认 PHP 模块与数据库连接可用（避免安装阶段失败）
@@ -403,8 +405,14 @@ if [ "$is_installed" -eq 1 ]; then
   ${WP_CMD_SAFE} --path="${WP_PATH}" eval 'echo "WP Imagick:".(extension_loaded("imagick")?"启用":"未启用")."\n";'
 fi
 
+# REST API 自检（https）
+if [ "$is_installed" -eq 1 ] && [ -n "${DOMAIN}" ]; then
+  code="$(curl -s -o /dev/null -w "%{http_code}" "https://${DOMAIN}/wp-json/")"
+  echo "REST API: https://${DOMAIN}/wp-json/ -> HTTP ${code}"
+fi
+
 # 输出
-if [ "$is_installed" -eq 1 ]; then
+  if [ "$is_installed" -eq 1 ]; then
   echo "WordPress 安装完成"
 else
   echo "WordPress 未安装（仅完成修复/环境配置）"
