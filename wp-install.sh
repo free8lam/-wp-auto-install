@@ -239,6 +239,22 @@ chown -R ${FPM_USER}:${FPM_GROUP} "${WP_PATH}/wp-content/uploads" "${WP_PATH}/wp
 find "${WP_PATH}/wp-content/uploads" -type d -exec chmod 755 {} \;
 find "${WP_PATH}/wp-content/uploads" -type f -exec chmod 644 {} \;
 chmod 755 "${WP_PATH}/wp-content/tmp"
+# 强制 WP HTTP API 使用 IPv4，避免服务器无IPv6时的 cURL 28 超时
+mkdir -p "${WP_PATH}/wp-content/mu-plugins"
+cat > "${WP_PATH}/wp-content/mu-plugins/force-ipv4-http.php" <<'PHP'
+<?php
+/*
+Plugin Name: Force IPv4 for HTTP API
+Description: Force WordPress HTTP requests to resolve via IPv4 to avoid IPv6 timeouts on servers without IPv6 connectivity.
+Version: 1.0
+*/
+add_action('http_api_curl', function($handle, $r, $url){
+    if (defined('CURL_IPRESOLVE') && defined('CURL_IPRESOLVE_V4')) {
+        curl_setopt($handle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+    }
+}, 10, 3);
+PHP
+chown -R ${FPM_USER}:${FPM_GROUP} "${WP_PATH}/wp-content/mu-plugins" || true
 
 # Nginx 全局上传与超时 + 缓存开关
 cat > /etc/nginx/conf.d/wordpress-global.conf <<'NG'
