@@ -384,7 +384,7 @@ ufw reload || true
 
 # SSL 与 443 加固
 if [ -n "${DOMAIN}" ]; then
-certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || echo "SSL申请失败，稍后重试"
+certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect --expand -n || echo "SSL申请失败，稍后重试"
 for SSL_CONF in "/etc/nginx/conf.d/${DOMAIN}.conf" "/etc/nginx/conf.d/${DOMAIN}-le-ssl.conf"; do
   if [ -f "$SSL_CONF" ] && grep -q "listen 443" "$SSL_CONF"; then
     grep -q "client_max_body_size" "$SSL_CONF" || sed -i '/listen 443/a \\    client_max_body_size 1024M;\\n    fastcgi_read_timeout 1800;\\n    fastcgi_connect_timeout 1800;\\n    fastcgi_send_timeout 1800;\\n    client_body_timeout 1800;\\n    send_timeout 1800;' "$SSL_CONF"
@@ -409,7 +409,7 @@ fi
 
 # REST API 自检（https）
 if [ "$is_installed" -eq 1 ] && [ -n "${DOMAIN}" ]; then
-  code="$(curl -s -o /dev/null -w "%{http_code}" "https://${DOMAIN}/wp-json/")"
+  code="$(curl -s -o /dev/null -w "%{http_code}" "https://${DOMAIN}/wp-json/" || echo 000)"
   echo "REST API: https://${DOMAIN}/wp-json/ -> HTTP ${code}"
 fi
 
