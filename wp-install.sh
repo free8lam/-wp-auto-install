@@ -65,10 +65,8 @@ apt install -y php-imagick || { apt install -y php-pear php${PHP_VERSION}-dev li
 # 如 mods-available 缺失，则手动创建并链接
 IMAGICK_MODS="/etc/php/${PHP_VERSION}/mods-available/imagick.ini"
 if [ ! -f "$IMAGICK_MODS" ]; then echo "extension=imagick" > "$IMAGICK_MODS"; fi
-phpenmod -v ${PHP_VERSION} -s all imagick || {
-  ln -sf "$IMAGICK_MODS" "/etc/php/${PHP_VERSION}/cli/conf.d/20-imagick.ini" || true
-  ln -sf "$IMAGICK_MODS" "/etc/php/${PHP_VERSION}/fpm/conf.d/20-imagick.ini" || true
-}
+phpenmod -v ${PHP_VERSION} -s fpm imagick || ln -sf "$IMAGICK_MODS" "/etc/php/${PHP_VERSION}/fpm/conf.d/20-imagick.ini" || true
+phpenmod -v ${PHP_VERSION} -s cli imagick || ln -sf "$IMAGICK_MODS" "/etc/php/${PHP_VERSION}/cli/conf.d/20-imagick.ini" || true
 systemctl restart php${PHP_VERSION}-fpm || true
 PHP_BIN_EARLY="$(command -v php${PHP_VERSION} || command -v php || true)"; [ -z "$PHP_BIN_EARLY" ] && PHP_BIN_EARLY="php"
 "$PHP_BIN_EARLY" -r 'echo "Imagick扩展:".(extension_loaded("imagick")?"已启用\n":"未启用\n");' || true
@@ -99,7 +97,7 @@ fi
 REPAIR_MODE=0
 get_cfg() { ${WP_CMD_SAFE} --path="${WP_PATH}" config get "$1" 2>/dev/null || true; }
 is_installed=0
-if [ -f "${WP_PATH}/wp-config.php" ]; then is_installed=1; fi
+: # 跳过仅以文件存在判定安装状态，改用 WP-CLI 真实检测
 if ${WP_CMD_SAFE} --path="${WP_PATH}" core is-installed >/dev/null 2>&1; then is_installed=1; fi
 if [ "$is_installed" -eq 1 ]; then
   REPAIR_MODE=1
@@ -306,14 +304,20 @@ if [ "$is_installed" -eq 0 ]; then
     --url="http://${DOMAIN}" --title="My Site" \
     --admin_user="${ADMIN_USER}" --admin_password="${ADMIN_PASS}" --admin_email="${SSL_EMAIL}"
 fi
-${WP_CMD_SAFE} --path="${WP_PATH}" option update permalink_structure "/%postname%/" || true
-${WP_CMD_SAFE} --path="${WP_PATH}" rewrite flush --hard || true
+if [ "$is_installed" -eq 1 ]; then
+  ${WP_CMD_SAFE} --path="${WP_PATH}" option update permalink_structure "/%postname%/" || true
+  ${WP_CMD_SAFE} --path="${WP_PATH}" rewrite flush --hard || true
+else
+  echo "跳过固定链接与重写刷新：站点未安装" || true
+fi
 
-# 主题安装（可选）
-if [ -n "${THEME_ZIP_PATH}" ] && [ -f "${THEME_ZIP_PATH}" ]; then ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_PATH}" --activate || true; elif [ -n "${THEME_ZIP_URL}" ]; then ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_URL}" --activate || true; fi
+# 主题安装（可选，需站点已安装）
+if [ "$is_installed" -eq 1 ]; then
+  if [ -n "${THEME_ZIP_PATH}" ] && [ -f "${THEME_ZIP_PATH}" ]; then ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_PATH}" --activate || true; elif [ -n "${THEME_ZIP_URL}" ]; then ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_URL}" --activate || true; fi
+fi
 
-# XML 导入（可选）
-if [ -n "${XML_FILE}" ] && [ -f "${XML_FILE}" ]; then ${WP_CMD} --path="${WP_PATH}" plugin install wordpress-importer --activate || true; ${WP_CMD} --path="${WP_PATH}" import "${XML_FILE}" --authors=create --skip="media" || ${WP_CMD} --path="${WP_PATH}" import "${XML_FILE}" --authors=create || true; fi
+# XML 导入（可选，需站点已安装）
+if [ "$is_installed" -eq 1 ] && [ -n "${XML_FILE}" ] && [ -f "${XML_FILE}" ]; then ${WP_CMD} --path="${WP_PATH}" plugin install wordpress-importer --activate || true; ${WP_CMD} --path="${WP_PATH}" import "${XML_FILE}" --authors=create --skip="media" || ${WP_CMD} --path="${WP_PATH}" import "${XML_FILE}" --authors=create || true; fi
 
 # 系统 Cron（替代 DISABLE_WP_CRON=true）
 echo "*/5 * * * * ${FPM_USER} /usr/bin/php -d register_argc_argv=On ${WP_PATH}/wp-cron.php >/dev/null 2>&1" > /etc/cron.d/wordpress
@@ -338,16 +342,20 @@ done
 fi
 nginx -t && systemctl reload nginx || true
 
-# 切换站点到 https
-if [ -n "${DOMAIN}" ]; then
-${WP_CMD} --path="${WP_PATH}" option update home "https://${DOMAIN}" || true
-${WP_CMD} --path="${WP_PATH}" option update siteurl "https://${DOMAIN}" || true
+# 切换站点到 https（需站点已安装且 DOMAIN 存在）
+if [ "$is_installed" -eq 1 ] && [ -n "${DOMAIN}" ]; then
+  ${WP_CMD_SAFE} --path="${WP_PATH}" option update home "https://${DOMAIN}" || true
+  ${WP_CMD_SAFE} --path="${WP_PATH}" option update siteurl "https://${DOMAIN}" || true
 fi
 systemctl restart php${PHP_VERSION}-fpm || true
 
 # 输出
-echo "WordPress 安装完成"
-echo "URL: https://${DOMAIN}"
+if [ "$is_installed" -eq 1 ]; then
+  echo "WordPress 安装完成"
+else
+  echo "WordPress 未安装（仅完成修复/环境配置）"
+fi
+echo "URL: ${SITEURL:-https://${DOMAIN}}"
 echo "WP_PATH: ${WP_PATH}"
 echo "DB: ${DB_NAME} 用户: ${DB_USER}"
-echo "管理员: ${ADMIN_USER}"
+echo "管理员:${ADMIN_USER}"
