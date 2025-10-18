@@ -15,6 +15,7 @@ ADMIN_PASS="${ADMIN_PASS:-}"
 XML_FILE="${XML_FILE:-}"
 THEME_ZIP_URL="${THEME_ZIP_URL:-}"
 THEME_ZIP_PATH="${THEME_ZIP_PATH:-}"
+THEME_SLUG="${THEME_SLUG:-}"
 
 WP_PATH="/var/www/wordpress"
 PHP_VERSION="8.3"
@@ -381,7 +382,15 @@ fi
 
 # 主题安装（可选，需站点已安装）
 if [ "$is_installed" -eq 1 ]; then
-  if [ -n "${THEME_ZIP_PATH}" ] && [ -f "${THEME_ZIP_PATH}" ]; then ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_PATH}" --activate || true; elif [ -n "${THEME_ZIP_URL}" ]; then ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_URL}" --activate || true; fi
+  if [ -n "${THEME_ZIP_PATH}" ] && [ -f "${THEME_ZIP_PATH}" ]; then
+    ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_PATH}" --activate || true
+  elif [ -n "${THEME_ZIP_URL}" ]; then
+    ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_ZIP_URL}" --activate || true
+  elif [ -n "${THEME_SLUG}" ]; then
+    ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_SLUG}" --activate || true
+  else
+    echo "跳过主题安装：未提供 THEME_ZIP_PATH/THEME_ZIP_URL/THEME_SLUG"
+  fi
 fi
 
 # XML 导入（可选，需站点已安装）
