@@ -398,13 +398,15 @@ fi
 if [ "$is_installed" -eq 1 ]; then
   if [ -n "${PLUGIN_SLUGS}" ]; then
     SLUGS="$(echo "${PLUGIN_SLUGS}" | tr ',;' ' ' | xargs -n1 | awk 'NF' | sort -u | xargs)"
-    # 若包含 Woo 相关插件，先确保 WooCommerce 就绪
+    # 若包含 Woo 相关插件，先确保 WooCommerce 就绪并创建默认页面
     if echo "${SLUGS}" | grep -Eq '(^| )woocommerce($| )|(^| )woocommerce-|(^| )woocommerce-payments($| )'; then
       if ! ${WP_CMD_SAFE} --path="${WP_PATH}" plugin is-installed woocommerce >/dev/null 2>&1; then
         ${WP_CMD} --path="${WP_PATH}" plugin install woocommerce --activate || true
       elif ! ${WP_CMD_SAFE} --path="${WP_PATH}" plugin is-active woocommerce >/dev/null 2>&1; then
         ${WP_CMD} --path="${WP_PATH}" plugin activate woocommerce || true
       fi
+      # 创建 WooCommerce 默认页面（Shop/Cart/Checkout/My account）
+      ${WP_CMD_SAFE} --path="${WP_PATH}" wc tool run install_pages >/dev/null 2>&1 || true
     fi
     for slug in ${SLUGS}; do
       echo "安装并启用插件: ${slug}"
@@ -413,8 +415,9 @@ if [ "$is_installed" -eq 1 ]; then
       else
         echo "插件安装/启用失败: ${slug}"
         if [ "${slug}" = "woocommerce-payments" ] || [ "${slug}" = "woopayments" ]; then
-          echo "WooPayments 激活失败，回退安装 Stripe 网关"
+          echo "WooPayments 激活失败，回退安装 Stripe 与 PayPal 网关"
           ${WP_CMD} --path="${WP_PATH}" plugin install woocommerce-gateway-stripe --activate || true
+          ${WP_CMD} --path="${WP_PATH}" plugin install woocommerce-paypal-payments --activate || true
         fi
       fi
     done
