@@ -60,14 +60,41 @@ apt install -y \
   php${PHP_VERSION}-xml php${PHP_VERSION}-zip php${PHP_VERSION}-xsl \
   php${PHP_VERSION}-opcache imagemagick certbot python3-certbot-nginx
 
-# Imagick 扩展
-apt install -y php-imagick || { apt install -y php-pear php${PHP_VERSION}-dev libmagickwand-dev || true; printf "\n" | pecl install imagick || true; }
-# 如 mods-available 缺失，则手动创建并链接
-IMAGICK_MODS="/etc/php/${PHP_VERSION}/mods-available/imagick.ini"
-if [ ! -f "$IMAGICK_MODS" ]; then echo "extension=imagick" > "$IMAGICK_MODS"; fi
-phpenmod -v ${PHP_VERSION} -s fpm imagick || ln -sf "$IMAGICK_MODS" "/etc/php/${PHP_VERSION}/fpm/conf.d/20-imagick.ini" || true
-phpenmod -v ${PHP_VERSION} -s cli imagick || ln -sf "$IMAGICK_MODS" "/etc/php/${PHP_VERSION}/cli/conf.d/20-imagick.ini" || true
-systemctl restart php${PHP_VERSION}-fpm || true
+# Imagick 扩展（更稳健的安装与启用）
+ensure_imagick_loaded() {
+  local phpv="${PHP_VERSION}"
+  local php_bin="$(command -v php${PHP_VERSION} || command -v php)"
+  # 尝试通过 apt 安装；失败则使用 pecl 编译（确保 dev 头与 wand 库）
+  apt install -y php-imagick >/dev/null 2>&1 || {
+    apt install -y php-pear "php${PHP_VERSION}-dev" libmagickwand-dev || true
+    yes '' | pecl install imagick || true
+  }
+  # 解析扩展目录，并确保 imagick.so 位于该目录（处理 pecl 安装到 /usr/local 的情况）
+  local cli_ext_dir
+  cli_ext_dir="$($php_bin -r 'echo ini_get("extension_dir");' 2>/dev/null || echo '')"
+  local so=""
+  for p in "/usr/lib/php" "/usr/local/lib/php/extensions" "/usr/lib64/php"; do
+    so="$(find "$p" -type f -name imagick.so 2>/dev/null | head -n1)"
+    [ -n "$so" ] && break
+  done
+  if [ -n "$cli_ext_dir" ] && [ -n "$so" ] && [ ! -f "${cli_ext_dir}/imagick.so" ]; then
+    cp "$so" "${cli_ext_dir}/imagick.so" || true
+  fi
+  # 创建并启用 ini（分别针对 fpm 与 cli）
+  local mods="/etc/php/${phpv}/mods-available/imagick.ini"
+  [ -f "$mods" ] || echo "extension=imagick" > "$mods"
+  phpenmod -v "${phpv}" -s fpm imagick || ln -sf "$mods" "/etc/php/${phpv}/fpm/conf.d/20-imagick.ini" || true
+  phpenmod -v "${phpv}" -s cli imagick || ln -sf "$mods" "/etc/php/${phpv}/cli/conf.d/20-imagick.ini" || true
+  # 重启 FPM；若失败则回滚以避免服务不可用
+  systemctl restart "php${phpv}-fpm" || {
+    echo "PHP-FPM 重启失败（可能 imagick ABI 不匹配），回滚 imagick.ini 以恢复服务" >&2
+    rm -f "/etc/php/${phpv}/fpm/conf.d/20-imagick.ini" "/etc/php/${phpv}/cli/conf.d/20-imagick.ini" || true
+    systemctl restart "php${phpv}-fpm" || true
+  }
+  # 打印 CLI 状态
+  $php_bin -r 'echo "CLI Imagick:".(extension_loaded("imagick")?"启用\n":"未启用\n");' || true
+}
+ensure_imagick_loaded
 PHP_BIN_EARLY="$(command -v php${PHP_VERSION} || command -v php || true)"; [ -z "$PHP_BIN_EARLY" ] && PHP_BIN_EARLY="php"
 "$PHP_BIN_EARLY" -r 'echo "Imagick扩展:".(extension_loaded("imagick")?"已启用\n":"未启用\n");' || true
 
@@ -351,6 +378,11 @@ if [ "$is_installed" -eq 1 ] && [ -n "${DOMAIN}" ]; then
   ${WP_CMD_SAFE} --path="${WP_PATH}" option update siteurl "https://${DOMAIN}" || true
 fi
 systemctl restart php${PHP_VERSION}-fpm || true
+
+# Imagick 状态（站点内）
+if [ "$is_installed" -eq 1 ]; then
+  ${WP_CMD_SAFE} --path="${WP_PATH}" eval 'echo "WP Imagick:".(extension_loaded("imagick")?"启用":"未启用")."\n";'
+fi
 
 # 输出
 if [ "$is_installed" -eq 1 ]; then
