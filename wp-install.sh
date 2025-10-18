@@ -26,7 +26,33 @@ if [ "$(id -u)" -ne 0 ]; then echo "请用 root 运行：sudo -E bash $0" >&2; e
 # 更新与安装基础组件
 apt update -y && apt upgrade -y
 apt install -y nginx mysql-server curl wget unzip software-properties-common ufw
-if ! apt-cache policy php${PHP_VERSION}-fpm | grep -q Candidate; then add-apt-repository -y ppa:ondrej/php; apt update -y; fi
+# 确保 PHP 版本可用（网络/DNS不通时跳过添加 PPA 并自动降级）
+ensure_php_version() {
+  local want="$PHP_VERSION"
+  # 候选存在则直接使用
+  if apt-cache policy "php${want}-fpm" | awk '/Candidate:/{print $2}' | grep -vq "(none)"; then
+    return 0
+  fi
+  # 网络可用时尝试添加 PPA
+  if getent hosts api.launchpad.net >/dev/null 2>&1 || getent hosts ppa.launchpad.net >/dev/null 2>&1; then
+    add-apt-repository -y ppa:ondrej/php && apt update -y || echo "PPA 添加失败，继续尝试可用版本"
+  else
+    echo "DNS/网络不可用，跳过添加 PPA：ondrej/php"
+  fi
+  # 选择最高可用的 PHP 版本
+  local avail
+  avail="$(apt-cache search '^php[0-9.]+-fpm$' | sed -n 's/^php\([0-9]\+\.[0-9]\+\)-fpm.*/\1/p' | sort -Vr)"
+  for v in $avail; do
+    if apt-cache policy "php${v}-fpm" | awk '/Candidate:/{print $2}' | grep -vq "(none)"; then
+      PHP_VERSION="$v"; export PHP_VERSION
+      echo "使用可用的 PHP 版本: ${PHP_VERSION}"
+      return 0
+    fi
+  done
+  echo "未找到可用的 PHP-FPM 包，无法继续。" >&2
+  exit 1
+}
+ensure_php_version
 apt install -y \
   php${PHP_VERSION}-fpm php${PHP_VERSION}-cli \
   php${PHP_VERSION}-mysql php${PHP_VERSION}-curl php${PHP_VERSION}-gd \
