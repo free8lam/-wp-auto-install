@@ -16,6 +16,7 @@ XML_FILE="${XML_FILE:-}"
 THEME_ZIP_URL="${THEME_ZIP_URL:-}"
 THEME_ZIP_PATH="${THEME_ZIP_PATH:-}"
 THEME_SLUG="${THEME_SLUG:-}"
+PLUGIN_SLUGS="${PLUGIN_SLUGS:-}"
 
 WP_PATH="/var/www/wordpress"
 PHP_VERSION="8.3"
@@ -390,6 +391,35 @@ if [ "$is_installed" -eq 1 ]; then
     ${WP_CMD} --path="${WP_PATH}" theme install "${THEME_SLUG}" --activate || true
   else
     echo "跳过主题安装：未提供 THEME_ZIP_PATH/THEME_ZIP_URL/THEME_SLUG"
+  fi
+fi
+
+# 插件安装（可选，支持按 slug 安装并自动回退）
+if [ "$is_installed" -eq 1 ]; then
+  if [ -n "${PLUGIN_SLUGS}" ]; then
+    SLUGS="$(echo "${PLUGIN_SLUGS}" | tr ',;' ' ' | xargs -n1 | awk 'NF' | sort -u | xargs)"
+    # 若包含 Woo 相关插件，先确保 WooCommerce 就绪
+    if echo "${SLUGS}" | grep -Eq '(^| )woocommerce($| )|(^| )woocommerce-|(^| )woocommerce-payments($| )'; then
+      if ! ${WP_CMD_SAFE} --path="${WP_PATH}" plugin is-installed woocommerce >/dev/null 2>&1; then
+        ${WP_CMD} --path="${WP_PATH}" plugin install woocommerce --activate || true
+      elif ! ${WP_CMD_SAFE} --path="${WP_PATH}" plugin is-active woocommerce >/dev/null 2>&1; then
+        ${WP_CMD} --path="${WP_PATH}" plugin activate woocommerce || true
+      fi
+    fi
+    for slug in ${SLUGS}; do
+      echo "安装并启用插件: ${slug}"
+      if ${WP_CMD} --path="${WP_PATH}" plugin install "${slug}" --activate; then
+        echo "插件已启用: ${slug}"
+      else
+        echo "插件安装/启用失败: ${slug}"
+        if [ "${slug}" = "woocommerce-payments" ] || [ "${slug}" = "woopayments" ]; then
+          echo "WooPayments 激活失败，回退安装 Stripe 网关"
+          ${WP_CMD} --path="${WP_PATH}" plugin install woocommerce-gateway-stripe --activate || true
+        fi
+      fi
+    done
+  else
+    echo "跳过插件安装：未提供 PLUGIN_SLUGS"
   fi
 fi
 
