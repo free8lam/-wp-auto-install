@@ -64,33 +64,52 @@ apt install -y \
 ensure_imagick_loaded() {
   local phpv="${PHP_VERSION}"
   local php_bin="$(command -v php${PHP_VERSION} || command -v php)"
-  # 尝试通过 apt 安装；失败则使用 pecl 编译（确保 dev 头与 wand 库）
-  apt install -y php-imagick >/dev/null 2>&1 || {
-    apt install -y php-pear "php${PHP_VERSION}-dev" libmagickwand-dev || true
-    yes '' | pecl install imagick || true
-  }
-  # 解析扩展目录，并确保 imagick.so 位于该目录（处理 pecl 安装到 /usr/local 的情况）
-  local cli_ext_dir
-  cli_ext_dir="$($php_bin -r 'echo ini_get("extension_dir");' 2>/dev/null || echo '')"
-  local so=""
-  for p in "/usr/lib/php" "/usr/local/lib/php/extensions" "/usr/lib64/php"; do
-    so="$(find "$p" -type f -name imagick.so 2>/dev/null | head -n1)"
-    [ -n "$so" ] && break
-  done
-  if [ -n "$cli_ext_dir" ] && [ -n "$so" ] && [ ! -f "${cli_ext_dir}/imagick.so" ]; then
-    cp "$so" "${cli_ext_dir}/imagick.so" || true
-  fi
+  local phpize_bin="$(command -v phpize${PHP_VERSION} || command -v phpize || echo '')"
+  local php_config_bin="$(command -v php-config${PHP_VERSION} || command -v php-config || echo '')"
+
+  # 先尝试 apt 安装 imagick
+  apt install -y php-imagick >/dev/null 2>&1 || true
+
   # 创建并启用 ini（分别针对 fpm 与 cli）
   local mods="/etc/php/${phpv}/mods-available/imagick.ini"
   [ -f "$mods" ] || echo "extension=imagick" > "$mods"
   phpenmod -v "${phpv}" -s fpm imagick || ln -sf "$mods" "/etc/php/${phpv}/fpm/conf.d/20-imagick.ini" || true
   phpenmod -v "${phpv}" -s cli imagick || ln -sf "$mods" "/etc/php/${phpv}/cli/conf.d/20-imagick.ini" || true
-  # 重启 FPM；若失败则回滚以避免服务不可用
-  systemctl restart "php${phpv}-fpm" || {
-    echo "PHP-FPM 重启失败（可能 imagick ABI 不匹配），回滚 imagick.ini 以恢复服务" >&2
-    rm -f "/etc/php/${phpv}/fpm/conf.d/20-imagick.ini" "/etc/php/${phpv}/cli/conf.d/20-imagick.ini" || true
-    systemctl restart "php${phpv}-fpm" || true
-  }
+  systemctl restart "php${phpv}-fpm" || true
+
+  # 若 CLI 仍未加载或 FPM 报错（ABI 不匹配），强制用目标版本工具链重新编译安装
+  if ! $php_bin -r 'exit(extension_loaded("imagick")?0:1);'; then
+    # 临时禁用以清除启动警告
+    phpdismod -v "${phpv}" -s fpm imagick || true
+    phpdismod -v "${phpv}" -s cli imagick || true
+
+    apt install -y php-pear "php${PHP_VERSION}-dev" libmagickwand-dev || true
+    if [ -x "$phpize_bin" ] && [ -x "$php_config_bin" ]; then
+      local tmpdir
+      tmpdir="$(mktemp -d)"
+      (
+        cd "$tmpdir" && pecl download imagick >/dev/null 2>&1 && \
+        tar -xzf imagick-*.tgz && cd imagick-* && \
+        "$phpize_bin" && ./configure --with-php-config="$php_config_bin" && \
+        make -j"$(nproc 2>/dev/null || echo 2)" && make install
+      ) || true
+      rm -rf "$tmpdir"
+    else
+      # 无法定位版本专属 phpize/php-config，则回退普通 pecl（可能失败）
+      yes '' | pecl install imagick || true
+    fi
+
+    # 重新启用 ini 并重启 FPM
+    [ -f "$mods" ] || echo "extension=imagick" > "$mods"
+    phpenmod -v "${phpv}" -s fpm imagick || ln -sf "$mods" "/etc/php/${phpv}/fpm/conf.d/20-imagick.ini" || true
+    phpenmod -v "${phpv}" -s cli imagick || ln -sf "$mods" "/etc/php/${phpv}/cli/conf.d/20-imagick.ini" || true
+    systemctl restart "php${phpv}-fpm" || {
+      echo "PHP-FPM 重启失败（可能 imagick ABI 不匹配），回滚 imagick.ini 以恢复服务" >&2
+      rm -f "/etc/php/${phpv}/fpm/conf.d/20-imagick.ini" "/etc/php/${phpv}/cli/conf.d/20-imagick.ini" || true
+      systemctl restart "php${phpv}-fpm" || true
+    }
+  fi
+
   # 打印 CLI 状态
   $php_bin -r 'echo "CLI Imagick:".(extension_loaded("imagick")?"启用\n":"未启用\n");' || true
 }
