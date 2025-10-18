@@ -315,7 +315,7 @@ ${WP_CMD} --path="${WP_PATH}" config create --dbname="${DB_NAME}" --dbuser="${DB
 define('FS_METHOD','direct');
 define('WP_MEMORY_LIMIT','512M');
 define('DISABLE_WP_CRON', true);
-define('FORCE_SSL_ADMIN', true);
+define('FORCE_SSL_ADMIN', false);
 PHP
 else
   # 纠正 wp-config.php 中可能存在的未加引号常量（由旧脚本或错误参数产生）
@@ -325,7 +325,7 @@ else
   ${WP_CMD_SAFE} --path="${WP_PATH}" config set FS_METHOD direct --type=constant --quiet || true
 ${WP_CMD_SAFE} --path="${WP_PATH}" config set WP_MEMORY_LIMIT 512M --type=constant --quiet || true
 ${WP_CMD_SAFE} --path="${WP_PATH}" config set DISABLE_WP_CRON true --type=constant --raw --quiet || true
-${WP_CMD_SAFE} --path="${WP_PATH}" config set FORCE_SSL_ADMIN true --type=constant --raw --quiet || true
+${WP_CMD_SAFE} --path="${WP_PATH}" config set FORCE_SSL_ADMIN false --type=constant --raw --quiet || true
 fi
 
 # 预检：确认 PHP 模块与数据库连接可用（避免安装阶段失败）
@@ -384,7 +384,15 @@ ufw reload || true
 
 # SSL 与 443 加固
 if [ -n "${DOMAIN}" ]; then
-certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect --expand -n || echo "SSL申请失败，稍后重试"
+WWW_AVAILABLE=0
+if getent hosts "www.${DOMAIN}" >/dev/null 2>&1; then WWW_AVAILABLE=1; fi
+if [ "$WWW_AVAILABLE" -eq 1 ]; then
+  certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || \
+  certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" --expand -n || echo "SSL申请失败，稍后重试"
+else
+  echo "跳过 www 别名：DNS 未解析 www.${DOMAIN}"
+  certbot --nginx -d "${DOMAIN}" -m "${SSL_EMAIL}" --agree-tos --redirect -n || echo "SSL申请失败，稍后重试"
+fi
 for SSL_CONF in "/etc/nginx/conf.d/${DOMAIN}.conf" "/etc/nginx/conf.d/${DOMAIN}-le-ssl.conf"; do
   if [ -f "$SSL_CONF" ] && grep -q "listen 443" "$SSL_CONF"; then
     grep -q "client_max_body_size" "$SSL_CONF" || sed -i '/listen 443/a \\    client_max_body_size 1024M;\\n    fastcgi_read_timeout 1800;\\n    fastcgi_connect_timeout 1800;\\n    fastcgi_send_timeout 1800;\\n    client_body_timeout 1800;\\n    send_timeout 1800;' "$SSL_CONF"
@@ -397,8 +405,19 @@ nginx -t && systemctl reload nginx || true
 
 # 切换站点到 https（需站点已安装且 DOMAIN 存在）
 if [ "$is_installed" -eq 1 ] && [ -n "${DOMAIN}" ]; then
+  # 依据 HTTPS 就绪状态切换站点URL与后台SSL
+SSL_READY=0
+ssl_code="$(curl -s -o /dev/null -w "%{http_code}" "https://${DOMAIN}/wp-json/" --connect-timeout 10 --max-time 15 || echo 000)"
+if echo "$ssl_code" | egrep -q '^(2|3)[0-9]{2}$'; then SSL_READY=1; fi
+if [ "$SSL_READY" -eq 1 ]; then
   ${WP_CMD_SAFE} --path="${WP_PATH}" option update home "https://${DOMAIN}" || true
   ${WP_CMD_SAFE} --path="${WP_PATH}" option update siteurl "https://${DOMAIN}" || true
+  ${WP_CMD_SAFE} --path="${WP_PATH}" config set FORCE_SSL_ADMIN true --type=constant --raw --quiet || true
+else
+  ${WP_CMD_SAFE} --path="${WP_PATH}" option update home "http://${DOMAIN}" || true
+  ${WP_CMD_SAFE} --path="${WP_PATH}" option update siteurl "http://${DOMAIN}" || true
+  ${WP_CMD_SAFE} --path="${WP_PATH}" config set FORCE_SSL_ADMIN false --type=constant --raw --quiet || true
+fi
 fi
 systemctl restart php${PHP_VERSION}-fpm || true
 
@@ -419,7 +438,7 @@ fi
 else
   echo "WordPress 未安装（仅完成修复/环境配置）"
 fi
-echo "URL: ${SITEURL:-https://${DOMAIN}}"
+echo "URL: $(${WP_CMD_SAFE} --path=\"${WP_PATH}\" option get siteurl 2>/dev/null || ${WP_CMD_SAFE} --path=\"${WP_PATH}\" option get home 2>/dev/null || echo \"http://${DOMAIN}\")"
 echo "WP_PATH: ${WP_PATH}"
 echo "DB: ${DB_NAME} 用户: ${DB_USER}"
 echo "管理员:${ADMIN_USER}"
