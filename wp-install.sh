@@ -17,6 +17,7 @@ THEME_ZIP_URL="${THEME_ZIP_URL:-}"
 THEME_ZIP_PATH="${THEME_ZIP_PATH:-}"
 THEME_SLUG="${THEME_SLUG:-}"
 PLUGIN_SLUGS="${PLUGIN_SLUGS:-}"
+WC_ADMIN_SAFE_MODE="${WC_ADMIN_SAFE_MODE:-1}"
 
 WP_PATH="/var/www/wordpress"
 PHP_VERSION="8.3"
@@ -279,6 +280,36 @@ add_action('http_api_curl', function($handle, $r, $url){
 }, 10, 3);
 PHP
 chown -R ${FPM_USER}:${FPM_GROUP} "${WP_PATH}/wp-content/mu-plugins/http-api-debug.php" || true
+
+# WooCommerce Admin 安全模式（禁用 Onboarding，避免 React removeChild 报错）
+if [ "${WC_ADMIN_SAFE_MODE}" = "1" ]; then
+cat > "${WP_PATH}/wp-content/mu-plugins/wc-admin-safe-mode.php" <<'PHP'
+<?php
+/*
+Plugin Name: WooCommerce Admin Safe Mode
+Description: Disable WooCommerce Onboarding (core-profiler) to avoid UI crashes and mark onboarding complete.
+Version: 1.0
+*/
+// 禁用 Onboarding 功能以避免弹层/DOM移除时的前端崩溃
+add_filter('woocommerce_admin_features', function($features){
+    if (!is_array($features)) return $features;
+    $disable = array('onboarding');
+    return array_values(array_diff($features, $disable));
+}, 20);
+// 隐藏主页/任务列表，避免重定向进向导
+add_filter('woocommerce_admin_show_home_screen', '__return_false', 20);
+// 后台加载时将 Onboarding 标记为完成，避免再次进入
+add_action('admin_init', function(){
+    $profile = get_option('woocommerce_onboarding_profile', array());
+    if (!isset($profile['completed']) || !$profile['completed']) {
+        $profile['completed'] = true;
+        update_option('woocommerce_onboarding_profile', $profile);
+    }
+    update_option('woocommerce_task_list_hidden', true);
+});
+PHP
+chown -R ${FPM_USER}:${FPM_GROUP} "${WP_PATH}/wp-content/mu-plugins/wc-admin-safe-mode.php" || true
+fi
 
 # Nginx 全局上传与超时 + 缓存开关
 cat > /etc/nginx/conf.d/wordpress-global.conf <<'NG'
