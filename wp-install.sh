@@ -27,7 +27,8 @@ if [ "$(id -u)" -ne 0 ]; then echo "请用 root 运行：sudo -E bash $0" >&2; e
 
 # 更新与安装基础组件
 apt update -y && apt upgrade -y
-apt install -y nginx mysql-server curl wget unzip software-properties-common ufw
+apt install -y nginx mysql-server curl wget unzip software-properties-common ufw ca-certificates
+update-ca-certificates || true
 # 确保 PHP 版本可用（网络/DNS不通时跳过添加 PPA 并自动降级）
 ensure_php_version() {
   local want="$PHP_VERSION"
@@ -258,6 +259,27 @@ add_action('http_api_curl', function($handle, $r, $url){
 PHP
 chown -R ${FPM_USER}:${FPM_GROUP} "${WP_PATH}/wp-content/mu-plugins" || true
 
+# HTTP API 调试 MU-Plugin：记录远程错误并强制 HTTP/1.1
+cat > "${WP_PATH}/wp-content/mu-plugins/http-api-debug.php" <<'PHP'
+<?php
+/*
+Plugin Name: HTTP API Debug
+Description: Log WP HTTP API errors and force HTTP/1.1 to improve compatibility with some proxies.
+Version: 1.0
+*/
+add_action('http_api_debug', function($response, $context, $class, $parsed_args, $url){
+    if (is_wp_error($response)) {
+        error_log('[HTTP API] context=' . $context . ' url=' . $url . ' error=' . $response->get_error_message());
+    }
+}, 10, 5);
+add_action('http_api_curl', function($handle, $r, $url){
+    if (defined('CURL_HTTP_VERSION_1_1')) {
+        curl_setopt($handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+    }
+}, 10, 3);
+PHP
+chown -R ${FPM_USER}:${FPM_GROUP} "${WP_PATH}/wp-content/mu-plugins/http-api-debug.php" || true
+
 # Nginx 全局上传与超时 + 缓存开关
 cat > /etc/nginx/conf.d/wordpress-global.conf <<'NG'
 client_max_body_size 1024M;
@@ -295,6 +317,12 @@ fi
 [ -f /etc/nginx/sites-enabled/default ] && rm -f /etc/nginx/sites-enabled/default || true
 mkdir -p /var/cache/nginx/wordpress && chown -R ${FPM_USER}:${FPM_GROUP} /var/cache/nginx || true
 nginx -t && systemctl reload nginx
+
+# WordPress.org 连通性预检
+WPORG_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://api.wordpress.org/themes/info/1.2/?action=query_themes" --connect-timeout 10 --max-time 15 || echo 000)
+if ! echo "$WPORG_CODE" | egrep -q '^(2|3)[0-9]{2}$'; then
+  echo "警告：无法连接 WordPress.org（HTTP $WPORG_CODE）。请检查防火墙、DNS、CA证书。"
+fi
 
 # PHP 配置
 for INI in /etc/php/${PHP_VERSION}/{fpm,cli}/php.ini; do [ -f "$INI" ] || continue;
